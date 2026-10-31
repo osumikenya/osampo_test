@@ -526,7 +526,7 @@ function DualMap({ engine, mapboxToken, darkMode, centerLat, centerLng, routePoi
             map.setPaintProperty('walk-route-line', 'line-width', activeLayer === 'route' ? 7 : 4);
         }
     }, [routePoints, actionLogs, activeLayer]);
-    return (React.createElement("div", { className: "relative w-full h-full min-h-[256px] rounded-xl overflow-hidden border border-slate-700/40 bg-slate-800" },
+    return (React.createElement("div", { className: "relative w-full h-full rounded-xl overflow-hidden border border-slate-700/40 bg-slate-800" },
         React.createElement("div", { ref: containerRef, className: "absolute inset-0 w-full h-full" }),
         React.createElement("div", { className: "absolute top-2 left-2 z-10 flex items-center gap-1.5" },
             React.createElement("span", { className: "bg-black/80 text-white text-[11px] px-2.5 py-1 rounded-full pointer-events-none border border-slate-700/50 shadow-md" }, engine === 'mapbox' && mapboxToken.trim().length > 10
@@ -1114,7 +1114,7 @@ function KunKatsuApp() {
                 React.createElement("span", null, "\uD83C\uDFC1"),
                 " \u76F4\u8FD1\u306E\u304A\u6563\u6B69\u30B5\u30DE\u30EA\u30FC"),
             latestWalk ? (React.createElement("div", { className: "bg-slate-900 p-4 rounded-2xl border border-slate-800 flex flex-col gap-3" },
-                React.createElement("div", { className: "h-56 w-full" },
+                React.createElement("div", { className: "h-64 w-full rounded-xl overflow-hidden" },
                     React.createElement(DualMap, { engine: mapEngine, mapboxToken: profile?.mapboxPublicToken || '', darkMode: darkMode, centerLat: summaryCenter.lat, centerLng: summaryCenter.lng, routePoints: latestWalk.routePoints, actionLogs: latestWalk.actionLogs, activeLayer: "sniff" })),
                 React.createElement("div", { className: "grid grid-cols-2 gap-2 text-xs" },
                     React.createElement("div", { className: "p-2 bg-slate-800/50 rounded-lg" },
