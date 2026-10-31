@@ -1,0 +1,1240 @@
+<!DOCTYPE html>
+<html lang="ja" class="dark">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no" />
+  <meta name="apple-mobile-web-app-capable" content="yes" />
+  <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent" />
+  <meta name="theme-color" content="#020617" />
+  <title>クン活ログ MVP — 愛犬お散歩トラッカー</title>
+  <!-- Tailwind CSS -->
+  <script src="https://cdn.tailwindcss.com"></script>
+  <!-- MapLibre GL JS (OpenStreetMap / 国土地理院タイル描画用) -->
+  <link href="https://unpkg.com/maplibre-gl@4.7.1/dist/maplibre-gl.css" rel="stylesheet" />
+  <script src="https://unpkg.com/maplibre-gl@4.7.1/dist/maplibre-gl.js"></script>
+  <!-- Mapbox GL JS (オプション切替用) -->
+  <link href="https://api.mapbox.com/mapbox-gl-js/v3.7.0/mapbox-gl.css" rel="stylesheet" />
+  <script src="https://api.mapbox.com/mapbox-gl-js/v3.7.0/mapbox-gl.js"></script>
+  <!-- React 18 Production -->
+  <script crossorigin src="https://unpkg.com/react@18/umd/react.production.min.js"></script>
+  <script crossorigin src="https://unpkg.com/react-dom@18/umd/react-dom.production.min.js"></script>
+  <style>
+    body {
+      background-color: #020617;
+      color: #f1f5f9;
+      margin: 0;
+      padding: 0;
+      font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, "Helvetica Neue", Arial, sans-serif;
+      -webkit-tap-highlight-color: transparent;
+      overscroll-behavior-y: none;
+    }
+  </style>
+</head>
+<body>
+  <div id="root"></div>
+  <script>
+const { useState, useEffect, useRef, useMemo } = React;
+// --- security.ts ---
+/**
+ * 2点間の距離（メートル）をHaversine公式で算出
+ */
+function calculateDistanceMeters(lat1, lng1, lat2, lng2) {
+    const R = 6371000; // 地球の半径 (m)
+    const toRad = (deg) => (deg * Math.PI) / 180;
+    const dLat = toRad(lat2 - lat1);
+    const dLng = toRad(lng2 - lng1);
+    const a = Math.sin(dLat / 2) * Math.sin(dLat / 2) +
+        Math.cos(toRad(lat1)) *
+            Math.cos(toRad(lat2)) *
+            Math.sin(dLng / 2) *
+            Math.sin(dLng / 2);
+    const c = 2 * Math.atan2(Math.sqrt(a), Math.sqrt(1 - a));
+    return R * c;
+}
+/**
+ * 【セキュリティ防衛①】クライアントサイド・ジオフェンストランケーション
+ * 取得したGPS座標が自宅から指定半径（例: 200m）以内にあるかを判定。
+ * true の場合、呼び出し元でその座標データ自体を即座に破棄（記録しない）する。
+ */
+function isInsideHomeGeofence(currentLat, currentLng, homeLat, homeLng, radiusMeters) {
+    if (homeLat === null || homeLng === null || radiusMeters <= 0) {
+        return false;
+    }
+    const distance = calculateDistanceMeters(currentLat, currentLng, homeLat, homeLng);
+    return distance <= radiusMeters;
+}
+/**
+ * 【セキュリティ防衛②】自宅中心座標のランダムオフセット生成（逆算防止）
+ * 自宅登録時に真の現在地から 距離30m〜70m・方位0°〜360° のランダムなズレを加え、
+ * 「オフセット済み中心座標」のみを返す。真の自宅座標は破棄される。
+ * マスク半径150m〜200mに対して最大70mのズレであれば、真の自宅は常にマスク円内（境界から最低80m〜130m以上奥）に保護される。
+ */
+function applyHomeRandomOffset(rawLat, rawLng, minOffsetMeters = 30, maxOffsetMeters = 70) {
+    // ランダムな距離 (30m 〜 70m)
+    const distance = minOffsetMeters + Math.random() * (maxOffsetMeters - minOffsetMeters);
+    // ランダムな方位 (0 〜 2π)
+    const angle = Math.random() * 2 * Math.PI;
+    const R = 6371000; // 地球半径 (m)
+    const latRad = (rawLat * Math.PI) / 180;
+    // 緯度・経度の変化量（ラジアン）
+    const deltaLat = (distance * Math.cos(angle)) / R;
+    const deltaLng = (distance * Math.sin(angle)) / (R * Math.cos(latRad));
+    return {
+        offsetLat: rawLat + (deltaLat * 180) / Math.PI,
+        offsetLng: rawLng + (deltaLng * 180) / Math.PI,
+    };
+}
+/**
+ * 2点間の移動速度（km/h）を算出
+ */
+function calculateSpeedKmh(distanceMeters, timeDiffMs) {
+    if (timeDiffMs <= 0)
+        return 0;
+    const hours = timeDiffMs / (1000 * 60 * 60);
+    const kilometers = distanceMeters / 1000;
+    return kilometers / hours;
+}
+/**
+ * 飼い主の消費カロリー（kcal）を算出
+ * 犬の散歩（METs = 3.0）× 飼い主の体重(kg) × 時間(h) × 1.05
+ */
+function calculateOwnerCalories(durationSec, ownerWeightKg) {
+    const hours = durationSec / 3600;
+    const mets = 3.0;
+    return Math.round(mets * ownerWeightKg * hours * 1.05);
+}
+/**
+ * 【セキュリティ防衛③】写真のExif情報（GPS座標・端末情報等）の完全削除
+ * HTML5 Canvasにピクセルデータのみを再描画することで、元のExifメタデータを完全に消去する。
+ */
+async function stripImageExifAndResize(file, maxWidth = 1080) {
+    return new Promise((resolve, reject) => {
+        const img = new Image();
+        const objectUrl = URL.createObjectURL(file);
+        img.onload = () => {
+            URL.revokeObjectURL(objectUrl);
+            const scale = img.width > maxWidth ? maxWidth / img.width : 1;
+            const canvas = document.createElement('canvas');
+            canvas.width = Math.round(img.width * scale);
+            canvas.height = Math.round(img.height * scale);
+            const ctx = canvas.getContext('2d');
+            if (!ctx) {
+                reject(new Error('Canvas context unavailable'));
+                return;
+            }
+            ctx.drawImage(img, 0, 0, canvas.width, canvas.height);
+            // JPEGとして再エンコードすることでExifメタデータを完全消去
+            const safeDataUrl = canvas.toDataURL('image/jpeg', 0.85);
+            resolve(safeDataUrl);
+        };
+        img.onerror = () => {
+            URL.revokeObjectURL(objectUrl);
+            reject(new Error('Failed to load image'));
+        };
+        img.src = objectUrl;
+    });
+}
+// --- db.ts ---
+const DB_NAME = 'KunKatsuLocalDB';
+const DB_VERSION = 1;
+const STORE_PROFILE = 'profile';
+const STORE_WALKS = 'walks';
+function openDB() {
+    return new Promise((resolve, reject) => {
+        if (typeof indexedDB === 'undefined') {
+            reject(new Error('IndexedDB is not supported'));
+            return;
+        }
+        const request = indexedDB.open(DB_NAME, DB_VERSION);
+        request.onupgradeneeded = () => {
+            const db = request.result;
+            if (!db.objectStoreNames.contains(STORE_PROFILE)) {
+                db.createObjectStore(STORE_PROFILE, { keyPath: 'id' });
+            }
+            if (!db.objectStoreNames.contains(STORE_WALKS)) {
+                db.createObjectStore(STORE_WALKS, { keyPath: 'id' });
+            }
+        };
+        request.onsuccess = () => resolve(request.result);
+        request.onerror = () => reject(request.error);
+    });
+}
+async function getDogProfile() {
+    const db = await openDB();
+    return new Promise((resolve, reject) => {
+        const tx = db.transaction(STORE_PROFILE, 'readonly');
+        const store = tx.objectStore(STORE_PROFILE);
+        const req = store.get('default_dog');
+        req.onsuccess = () => {
+            if (req.result) {
+                resolve(req.result);
+            }
+            else {
+                const defaultProfile = {
+                    id: 'default_dog',
+                    name: '愛犬',
+                    breed: 'ゴールデンレトリバー',
+                    birthDate: '2023-05-01',
+                    weightKg: 28,
+                    ownerWeightKg: 65,
+                    homeLat: null,
+                    homeLng: null,
+                    geofenceRadiusMeters: 200, // 確定仕様: 初期値200m (下限150m)
+                    mapboxPublicToken: '',
+                };
+                resolve(defaultProfile);
+            }
+        };
+        req.onerror = () => reject(req.error);
+    });
+}
+async function saveDogProfile(profile) {
+    const db = await openDB();
+    return new Promise((resolve, reject) => {
+        const tx = db.transaction(STORE_PROFILE, 'readwrite');
+        tx.objectStore(STORE_PROFILE).put(profile);
+        tx.oncomplete = () => resolve();
+        tx.onerror = () => reject(tx.error);
+    });
+}
+async function getAllWalks() {
+    const db = await openDB();
+    return new Promise((resolve, reject) => {
+        const tx = db.transaction(STORE_WALKS, 'readonly');
+        const store = tx.objectStore(STORE_WALKS);
+        const req = store.getAll();
+        req.onsuccess = () => {
+            const list = req.result || [];
+            list.sort((a, b) => b.startTime - a.startTime);
+            resolve(list);
+        };
+        req.onerror = () => reject(req.error);
+    });
+}
+async function saveWalkSession(walk) {
+    const db = await openDB();
+    return new Promise((resolve, reject) => {
+        const tx = db.transaction(STORE_WALKS, 'readwrite');
+        tx.objectStore(STORE_WALKS).put(walk);
+        tx.oncomplete = () => resolve();
+        tx.onerror = () => reject(tx.error);
+    });
+}
+/**
+ * 室内でもすぐにヒートマップ描画・エンジン比較を試せるサンプルデータ生成
+ */
+async function seedDemoWalkData(baseLat, baseLng) {
+    const now = Date.now();
+    const demoWalk = {
+        id: `demo_${now}`,
+        startTime: now - 1800 * 1000,
+        endTime: now,
+        distanceMeters: 1450,
+        durationSec: 1800,
+        sniffDurationSec: 410,
+        ownerCaloriesKcal: 102,
+        memo: '公園の角の電柱と草むらで念入りにクン活！',
+        routePoints: [
+            { lat: baseLat + 0.0012, lng: baseLng + 0.001, timestamp: now - 1700000, speedKmh: 3.8 },
+            { lat: baseLat + 0.0018, lng: baseLng + 0.0015, timestamp: now - 1400000, speedKmh: 4.0 },
+            { lat: baseLat + 0.0024, lng: baseLng + 0.0012, timestamp: now - 1100000, speedKmh: 3.5 },
+            { lat: baseLat + 0.0021, lng: baseLng + 0.0004, timestamp: now - 700000, speedKmh: 3.9 },
+            { lat: baseLat + 0.0014, lng: baseLng + 0.0006, timestamp: now - 300000, speedKmh: 3.6 },
+        ],
+        actionLogs: [
+            {
+                id: `log_1_${now}`,
+                walkId: `demo_${now}`,
+                timestamp: now - 1500000,
+                lat: baseLat + 0.0018,
+                lng: baseLng + 0.0015,
+                type: 'sniff_manual',
+                durationSec: 25,
+                weight: 3,
+            },
+            {
+                id: `log_2_${now}`,
+                walkId: `demo_${now}`,
+                timestamp: now - 1450000,
+                lat: baseLat + 0.00185,
+                lng: baseLng + 0.00152,
+                type: 'pee',
+                durationSec: 10,
+                weight: 2,
+            },
+            {
+                id: `log_3_${now}`,
+                walkId: `demo_${now}`,
+                timestamp: now - 1100000,
+                lat: baseLat + 0.0024,
+                lng: baseLng + 0.0012,
+                type: 'sniff_auto',
+                durationSec: 18,
+                weight: 1,
+            },
+            {
+                id: `log_4_${now}`,
+                walkId: `demo_${now}`,
+                timestamp: now - 700000,
+                lat: baseLat + 0.0021,
+                lng: baseLng + 0.0004,
+                type: 'poop',
+                durationSec: 30,
+                weight: 3,
+                poopCondition: 'normal',
+            },
+        ],
+    };
+    await saveWalkSession(demoWalk);
+}
+function DualMap({ engine, mapboxToken, darkMode, centerLat, centerLng, routePoints, actionLogs, activeLayer, }) {
+    const containerRef = useRef(null);
+    const mapInstanceRef = useRef(null);
+    const isLoadedRef = useRef(false);
+    // タイルソース切替（OSM標準 ⇄ 国土地理院タイル）
+    const [tileProvider, setTileProvider] = useState('osm');
+    const latestPropsRef = useRef({ routePoints, actionLogs, activeLayer });
+    latestPropsRef.current = { routePoints, actionLogs, activeLayer };
+    // GeoJSON生成ヘルパー
+    const createRouteGeoJson = (pts) => ({
+        type: 'FeatureCollection',
+        features: pts.length >= 2
+            ? [
+                {
+                    type: 'Feature',
+                    geometry: {
+                        type: 'LineString',
+                        coordinates: pts.map((p) => [p.lng, p.lat]),
+                    },
+                },
+            ]
+            : [],
+    });
+    const createPointsGeoJson = (logs, layer) => ({
+        type: 'FeatureCollection',
+        features: logs
+            .filter((log) => {
+            if (layer === 'sniff')
+                return log.type === 'sniff_auto' || log.type === 'sniff_manual';
+            if (layer === 'excretion')
+                return log.type === 'pee' || log.type === 'poop';
+            return true;
+        })
+            .map((log) => ({
+            type: 'Feature',
+            properties: {
+                weight: log.weight,
+                type: log.type,
+                durationSec: log.durationSec,
+            },
+            geometry: {
+                type: 'Point',
+                coordinates: [log.lng, log.lat],
+            },
+        })),
+    });
+    // 1. 地図インスタンスの初期化
+    useEffect(() => {
+        if (!containerRef.current)
+            return;
+        isLoadedRef.current = false;
+        if (mapInstanceRef.current) {
+            mapInstanceRef.current.remove();
+            mapInstanceRef.current = null;
+        }
+        const useMapbox = engine === 'mapbox' && mapboxToken.trim().length > 10;
+        // APIキー完全不要・WebWorker不要で確実に描画されるラスタータイル方式
+        const rasterTiles = tileProvider === 'osm'
+            ? ['https://tile.openstreetmap.org/{z}/{x}/{y}.png']
+            : ['https://cyberjapandata.gsi.go.jp/xyz/std/{z}/{x}/{y}.png'];
+        const rasterAttribution = tileProvider === 'osm'
+            ? '© OpenStreetMap contributors'
+            : '© 国土地理院 (GSI Japan)';
+        const rasterStyle = {
+            version: 8,
+            sources: {
+                'raster-tiles': {
+                    type: 'raster',
+                    tiles: rasterTiles,
+                    tileSize: 256,
+                    attribution: rasterAttribution,
+                },
+            },
+            layers: [
+                {
+                    id: 'base-raster-layer',
+                    type: 'raster',
+                    source: 'raster-tiles',
+                    minzoom: 0,
+                    maxzoom: 19,
+                    paint: {
+                        // 真っ暗にならず夜間でも道路・公園がはっきり見える明るさを維持
+                        'raster-brightness-max': darkMode ? 0.88 : 1.0,
+                        'raster-contrast': darkMode ? 0.08 : 0,
+                    },
+                },
+            ],
+        };
+        let map;
+        if (useMapbox) {
+            mapboxgl.accessToken = mapboxToken.trim();
+            map = new mapboxgl.Map({
+                container: containerRef.current,
+                style: darkMode
+                    ? 'mapbox://styles/mapbox/dark-v11'
+                    : 'mapbox://styles/mapbox/streets-v12',
+                center: [centerLng, centerLat],
+                zoom: 15.5,
+            });
+        }
+        else {
+            map = new maplibregl.Map({
+                container: containerRef.current,
+                style: rasterStyle,
+                center: [centerLng, centerLat],
+                zoom: 15.5,
+            });
+        }
+        mapInstanceRef.current = map;
+        map.on('load', () => {
+            isLoadedRef.current = true;
+            map.resize();
+            const { routePoints: currentRoutes, actionLogs: currentLogs, activeLayer: currentLayer, } = latestPropsRef.current;
+            // ルート軌跡ソース＆レイヤー
+            map.addSource('walk-route', {
+                type: 'geojson',
+                data: createRouteGeoJson(currentRoutes),
+            });
+            map.addLayer({
+                id: 'walk-route-line',
+                type: 'line',
+                source: 'walk-route',
+                layout: {
+                    'line-join': 'round',
+                    'line-cap': 'round',
+                },
+                paint: {
+                    'line-color': currentLayer === 'route' ? '#10b981' : '#3b82f6',
+                    'line-width': currentLayer === 'route' ? 7 : 4,
+                    'line-opacity': 0.85,
+                },
+            });
+            // アクションポイント（クン活・排泄）ソース＆ヒートマップ
+            map.addSource('action-points', {
+                type: 'geojson',
+                data: createPointsGeoJson(currentLogs, currentLayer),
+            });
+            map.addLayer({
+                id: 'kunkatsu-heatmap',
+                type: 'heatmap',
+                source: 'action-points',
+                paint: {
+                    'heatmap-weight': ['get', 'weight'],
+                    'heatmap-intensity': 1.5,
+                    'heatmap-color': [
+                        'interpolate',
+                        ['linear'],
+                        ['heatmap-density'],
+                        0,
+                        'rgba(0, 0, 255, 0)',
+                        0.2,
+                        'rgba(16, 185, 129, 0.5)',
+                        0.5,
+                        'rgba(250, 204, 21, 0.8)',
+                        0.8,
+                        'rgba(249, 115, 22, 0.9)',
+                        1,
+                        'rgba(239, 68, 68, 1)',
+                    ],
+                    'heatmap-radius': 28,
+                    'heatmap-opacity': 0.85,
+                },
+            });
+            // ピン丸印
+            map.addLayer({
+                id: 'action-circles',
+                type: 'circle',
+                source: 'action-points',
+                paint: {
+                    'circle-radius': [
+                        'match',
+                        ['get', 'type'],
+                        'sniff_manual',
+                        8,
+                        'poop',
+                        8,
+                        'pee',
+                        7,
+                        5,
+                    ],
+                    'circle-color': [
+                        'match',
+                        ['get', 'type'],
+                        'sniff_manual',
+                        '#f59e0b',
+                        'sniff_auto',
+                        '#fde047',
+                        'pee',
+                        '#38bdf8',
+                        'poop',
+                        '#a855f7',
+                        '#ffffff',
+                    ],
+                    'circle-stroke-width': 2,
+                    'circle-stroke-color': '#1f2937',
+                },
+            });
+        });
+        // リサイズ監視（タブ切替時や画面サイズ変更時）
+        const resizeObserver = new ResizeObserver(() => {
+            if (mapInstanceRef.current) {
+                mapInstanceRef.current.resize();
+            }
+        });
+        if (containerRef.current) {
+            resizeObserver.observe(containerRef.current);
+        }
+        return () => {
+            resizeObserver.disconnect();
+            if (mapInstanceRef.current) {
+                mapInstanceRef.current.remove();
+                mapInstanceRef.current = null;
+            }
+        };
+    }, [engine, mapboxToken, darkMode, tileProvider]);
+    // 2. 中心座標の更新（マップを再生成せずスムーズに移動）
+    useEffect(() => {
+        if (!mapInstanceRef.current)
+            return;
+        mapInstanceRef.current.setCenter([centerLng, centerLat]);
+    }, [centerLat, centerLng]);
+    // 3. データ（ルート・アクションログ）とレイヤーの更新（マップ破棄なし）
+    useEffect(() => {
+        if (!mapInstanceRef.current || !isLoadedRef.current)
+            return;
+        const map = mapInstanceRef.current;
+        const routeSource = map.getSource('walk-route');
+        if (routeSource) {
+            routeSource.setData(createRouteGeoJson(routePoints));
+        }
+        const actionSource = map.getSource('action-points');
+        if (actionSource) {
+            actionSource.setData(createPointsGeoJson(actionLogs, activeLayer));
+        }
+        if (map.getLayer('walk-route-line')) {
+            map.setPaintProperty('walk-route-line', 'line-color', activeLayer === 'route' ? '#10b981' : '#3b82f6');
+            map.setPaintProperty('walk-route-line', 'line-width', activeLayer === 'route' ? 7 : 4);
+        }
+    }, [routePoints, actionLogs, activeLayer]);
+    return (React.createElement("div", { className: "relative w-full h-full min-h-[256px] rounded-xl overflow-hidden border border-slate-700/40 bg-slate-800" },
+        React.createElement("div", { ref: containerRef, className: "absolute inset-0 w-full h-full" }),
+        React.createElement("div", { className: "absolute top-2 left-2 z-10 flex items-center gap-1.5" },
+            React.createElement("span", { className: "bg-black/80 text-white text-[11px] px-2.5 py-1 rounded-full pointer-events-none border border-slate-700/50 shadow-md" }, engine === 'mapbox' && mapboxToken.trim().length > 10
+                ? '🗺️ Mapbox GL'
+                : tileProvider === 'osm'
+                    ? '🗺️ OpenStreetMap'
+                    : '🗺️ 国土地理院地図'),
+            !(engine === 'mapbox' && mapboxToken.trim().length > 10) && (React.createElement("button", { type: "button", onClick: () => setTileProvider((prev) => (prev === 'osm' ? 'gsi' : 'osm')), className: "bg-slate-900/90 hover:bg-slate-800 text-emerald-300 text-[11px] px-2.5 py-1 rounded-full border border-emerald-500/40 shadow-md transition active:scale-95", title: "\u5730\u56F3\u30BF\u30A4\u30EB\u30B5\u30FC\u30D0\u30FC\u3092\u5207\u308A\u66FF\u3048" },
+                "\u5207\u66FF (",
+                tileProvider === 'osm' ? '地理院へ' : 'OSMへ',
+                ")")))));
+}
+// --- page.tsx ---
+// DualMap is directly available in scope
+function KunKatsuApp() {
+    const [activeTab, setActiveTab] = useState('walk');
+    const [profile, setProfile] = useState(null);
+    const [mapEngine, setMapEngine] = useState('osm');
+    const [darkMode, setDarkMode] = useState(true);
+    const [pocketLock, setPocketLock] = useState(false);
+    const [unlockProgress, setUnlockProgress] = useState(0);
+    const [isWalking, setIsWalking] = useState(false);
+    const [isSimulating, setIsSimulating] = useState(false);
+    const [elapsedSec, setElapsedSec] = useState(0);
+    const [distanceMeters, setDistanceMeters] = useState(0);
+    const [sniffTotalSec, setSniffTotalSec] = useState(0);
+    const [currentLat, setCurrentLat] = useState(34.3853);
+    const [currentLng, setCurrentLng] = useState(132.4553);
+    const [routePoints, setRoutePoints] = useState([]);
+    const [actionLogs, setActionLogs] = useState([]);
+    const [geofenceMaskedCount, setGeofenceMaskedCount] = useState(0);
+    const [undoTargetId, setUndoTargetId] = useState(null);
+    const [showPoopSelectorForId, setShowPoopSelectorForId] = useState(null);
+    const [stopHoldProgress, setStopHoldProgress] = useState(0);
+    const [latestWalk, setLatestWalk] = useState(null);
+    const [allWalks, setAllWalks] = useState([]);
+    const [heatmapLayer, setHeatmapLayer] = useState('sniff');
+    const [periodFilter, setPeriodFilter] = useState('all');
+    const slowStartTimestampRef = useRef(null);
+    const lastPointRef = useRef(null);
+    const holdIntervalRef = useRef(null);
+    const unlockIntervalRef = useRef(null);
+    const wakeLockRef = useRef(null);
+    // 初期化・プロフィール取得・現在地取得
+    useEffect(() => {
+        const hour = new Date().getHours();
+        setDarkMode(hour >= 18 || hour < 6);
+        (async () => {
+            const loadedProfile = await getDogProfile();
+            setProfile(loadedProfile);
+            const walks = await getAllWalks();
+            setAllWalks(walks);
+            if (walks.length > 0)
+                setLatestWalk(walks[0]);
+            if ('geolocation' in navigator) {
+                navigator.geolocation.getCurrentPosition((pos) => {
+                    const rawLat = pos.coords.latitude;
+                    const rawLng = pos.coords.longitude;
+                    if (isInsideHomeGeofence(rawLat, rawLng, loadedProfile.homeLat, loadedProfile.homeLng, loadedProfile.geofenceRadiusMeters) &&
+                        loadedProfile.homeLat !== null &&
+                        loadedProfile.homeLng !== null) {
+                        setCurrentLat(loadedProfile.homeLat);
+                        setCurrentLng(loadedProfile.homeLng);
+                    }
+                    else {
+                        setCurrentLat(rawLat);
+                        setCurrentLng(rawLng);
+                    }
+                }, () => { });
+            }
+        })();
+    }, []);
+    // 散歩タイマー
+    useEffect(() => {
+        if (!isWalking)
+            return;
+        const timer = setInterval(() => {
+            setElapsedSec((prev) => prev + 1);
+        }, 1000);
+        return () => clearInterval(timer);
+    }, [isWalking]);
+    // Screen Wake Lock API の自動制御（散歩中のスリープ防止）
+    useEffect(() => {
+        if (!isWalking) {
+            if (wakeLockRef.current) {
+                wakeLockRef.current.release().catch(() => { });
+                wakeLockRef.current = null;
+            }
+            return;
+        }
+        const requestWakeLock = async () => {
+            if ('wakeLock' in navigator) {
+                try {
+                    wakeLockRef.current = await navigator.wakeLock.request('screen');
+                }
+                catch (err) {
+                    console.warn('Wake Lock request failed:', err);
+                }
+            }
+        };
+        requestWakeLock();
+        const handleVisibilityChange = () => {
+            if (document.visibilityState === 'visible' && isWalking) {
+                requestWakeLock();
+            }
+        };
+        document.addEventListener('visibilitychange', handleVisibilityChange);
+        return () => {
+            document.removeEventListener('visibilitychange', handleVisibilityChange);
+            if (wakeLockRef.current) {
+                wakeLockRef.current.release().catch(() => { });
+                wakeLockRef.current = null;
+            }
+        };
+    }, [isWalking]);
+    // 室内GPSシミュレーター
+    useEffect(() => {
+        if (!isWalking || !isSimulating)
+            return;
+        const simTimer = setInterval(() => {
+            const isStoppingToSniff = Math.random() < 0.35;
+            const stepLat = isStoppingToSniff ? 0.000005 : (Math.random() - 0.3) * 0.00012;
+            const stepLng = isStoppingToSniff ? 0.000005 : (Math.random() - 0.3) * 0.00012;
+            handleNewCoordinate(currentLat + stepLat, currentLng + stepLng, Date.now());
+        }, 2000);
+        return () => clearInterval(simTimer);
+    }, [isWalking, isSimulating, currentLat, currentLng]);
+    // 実機GPS監視
+    useEffect(() => {
+        if (!isWalking || isSimulating || !('geolocation' in navigator))
+            return;
+        const watchId = navigator.geolocation.watchPosition((pos) => {
+            handleNewCoordinate(pos.coords.latitude, pos.coords.longitude, pos.timestamp);
+        }, () => { }, { enableHighAccuracy: true, maximumAge: 1000 });
+        return () => navigator.geolocation.clearWatch(watchId);
+    }, [isWalking, isSimulating, profile]);
+    // 座標受信ハンドラ（StrictMode 二重加算バグ防止のため updater 外で副作用を処理）
+    const handleNewCoordinate = (lat, lng, timestamp) => {
+        // 自宅防犯マスク判定（半径内は座標データそのものを即時破棄し、現在地表示もオフセット中心に固定）
+        if (profile &&
+            isInsideHomeGeofence(lat, lng, profile.homeLat, profile.homeLng, profile.geofenceRadiusMeters)) {
+            if (profile.homeLat !== null && profile.homeLng !== null) {
+                setCurrentLat(profile.homeLat);
+                setCurrentLng(profile.homeLng);
+            }
+            setGeofenceMaskedCount((c) => c + 1);
+            return;
+        }
+        setCurrentLat(lat);
+        setCurrentLng(lng);
+        const last = lastPointRef.current;
+        let speedKmh = 0;
+        let dist = 0;
+        if (last) {
+            dist = calculateDistanceMeters(last.lat, last.lng, lat, lng);
+            const timeDiff = timestamp - last.timestamp;
+            speedKmh = calculateSpeedKmh(dist, timeDiff);
+            if (dist >= 0.5) {
+                setDistanceMeters((d) => Math.round(d + dist));
+            }
+            // クン活自動判定（時速1.0km以下、5〜90秒滞在）
+            if (speedKmh <= 1.0) {
+                if (!slowStartTimestampRef.current) {
+                    slowStartTimestampRef.current = last.timestamp;
+                }
+            }
+            else {
+                if (slowStartTimestampRef.current) {
+                    const staySec = Math.round((timestamp - slowStartTimestampRef.current) / 1000);
+                    if (staySec >= 5 && staySec <= 90) {
+                        setSniffTotalSec((s) => s + staySec);
+                        const autoLog = {
+                            id: `auto_${Date.now()}`,
+                            walkId: 'current',
+                            timestamp,
+                            lat: last.lat,
+                            lng: last.lng,
+                            type: 'sniff_auto',
+                            durationSec: staySec,
+                            weight: 1,
+                        };
+                        setActionLogs((logs) => [...logs, autoLog]);
+                    }
+                    slowStartTimestampRef.current = null;
+                }
+            }
+        }
+        const newPoint = { lat, lng, timestamp, speedKmh };
+        lastPointRef.current = newPoint;
+        setRoutePoints((prev) => [...prev, newPoint]);
+    };
+    const triggerVibration = (pattern) => {
+        if (typeof window !== 'undefined' && 'vibrate' in navigator) {
+            try {
+                navigator.vibrate(pattern);
+            }
+            catch (_) { }
+        }
+    };
+    const handleManualAction = (type) => {
+        if (!isWalking)
+            return;
+        if (type === 'sniff_manual')
+            triggerVibration([40, 60, 40]);
+        if (type === 'pee')
+            triggerVibration(50);
+        if (type === 'poop')
+            triggerVibration(180);
+        if (profile &&
+            isInsideHomeGeofence(currentLat, currentLng, profile.homeLat, profile.homeLng, profile.geofenceRadiusMeters)) {
+            alert('自宅マスク範囲内のため、座標ピン留めはスキップされました（防犯保護）');
+            return;
+        }
+        const logId = `manual_${Date.now()}`;
+        const newLog = {
+            id: logId,
+            walkId: 'current',
+            timestamp: Date.now(),
+            lat: currentLat,
+            lng: currentLng,
+            type,
+            durationSec: type === 'sniff_manual' ? 15 : 10,
+            weight: 3,
+            poopCondition: type === 'poop' ? 'normal' : undefined,
+        };
+        if (type === 'sniff_manual') {
+            setSniffTotalSec((s) => s + 15);
+        }
+        setActionLogs((prev) => [...prev, newLog]);
+        setUndoTargetId(logId);
+        if (type === 'poop') {
+            setShowPoopSelectorForId(logId);
+        }
+        setTimeout(() => {
+            setUndoTargetId((current) => (current === logId ? null : current));
+            setShowPoopSelectorForId((current) => (current === logId ? null : current));
+        }, 3000);
+    };
+    const handleUndoLastAction = () => {
+        if (!undoTargetId)
+            return;
+        const target = actionLogs.find((l) => l.id === undoTargetId);
+        if (target && target.type === 'sniff_manual') {
+            setSniffTotalSec((s) => Math.max(0, s - target.durationSec));
+        }
+        setActionLogs((prev) => prev.filter((l) => l.id !== undoTargetId));
+        setUndoTargetId(null);
+        setShowPoopSelectorForId(null);
+    };
+    const handleSelectPoopCondition = (cond) => {
+        if (!showPoopSelectorForId)
+            return;
+        setActionLogs((prev) => prev.map((l) => l.id === showPoopSelectorForId ? { ...l, poopCondition: cond } : l));
+        setShowPoopSelectorForId(null);
+    };
+    const startWalk = (withSimulator = false) => {
+        setElapsedSec(0);
+        setDistanceMeters(0);
+        setSniffTotalSec(0);
+        setRoutePoints([]);
+        setActionLogs([]);
+        setGeofenceMaskedCount(0);
+        lastPointRef.current = null;
+        slowStartTimestampRef.current = null;
+        setIsSimulating(withSimulator);
+        setIsWalking(true);
+    };
+    const finishWalk = async () => {
+        setIsWalking(false);
+        setIsSimulating(false);
+        setPocketLock(false);
+        lastPointRef.current = null;
+        slowStartTimestampRef.current = null;
+        const walkId = `walk_${Date.now()}`;
+        const ownerWeight = profile?.ownerWeightKg || 65;
+        const completedWalk = {
+            id: walkId,
+            startTime: Date.now() - elapsedSec * 1000,
+            endTime: Date.now(),
+            distanceMeters,
+            durationSec: elapsedSec,
+            sniffDurationSec: sniffTotalSec,
+            ownerCaloriesKcal: calculateOwnerCalories(elapsedSec, ownerWeight),
+            routePoints,
+            actionLogs,
+            memo: '',
+        };
+        await saveWalkSession(completedWalk);
+        setLatestWalk(completedWalk);
+        const walks = await getAllWalks();
+        setAllWalks(walks);
+        setActiveTab('summary');
+    };
+    // 散歩終了長押しハンドラ
+    const handleStopHoldStart = () => {
+        if (holdIntervalRef.current)
+            clearInterval(holdIntervalRef.current);
+        let progress = 0;
+        holdIntervalRef.current = setInterval(() => {
+            progress += 5;
+            if (progress >= 100) {
+                clearInterval(holdIntervalRef.current);
+                setStopHoldProgress(0);
+                finishWalk();
+            }
+            else {
+                setStopHoldProgress(progress);
+            }
+        }, 100);
+    };
+    const handleStopHoldEnd = () => {
+        if (holdIntervalRef.current) {
+            clearInterval(holdIntervalRef.current);
+            holdIntervalRef.current = null;
+        }
+        setStopHoldProgress(0);
+    };
+    // ポケットロック解除長押しハンドラ
+    const handleUnlockHoldStart = () => {
+        if (unlockIntervalRef.current)
+            clearInterval(unlockIntervalRef.current);
+        let progress = 0;
+        unlockIntervalRef.current = setInterval(() => {
+            progress += 10;
+            if (progress >= 100) {
+                clearInterval(unlockIntervalRef.current);
+                setUnlockProgress(0);
+                setPocketLock(false);
+            }
+            else {
+                setUnlockProgress(progress);
+            }
+        }, 100);
+    };
+    const handleUnlockHoldEnd = () => {
+        if (unlockIntervalRef.current) {
+            clearInterval(unlockIntervalRef.current);
+            unlockIntervalRef.current = null;
+        }
+        setUnlockProgress(0);
+    };
+    const formatTime = (totalSec) => {
+        const mins = Math.floor(totalSec / 60);
+        const secs = totalSec % 60;
+        return `${mins.toString().padStart(2, '0')}:${secs.toString().padStart(2, '0')}`;
+    };
+    // 期間フィルタに基づくヒートマップ対象データの算出
+    const filteredWalks = useMemo(() => {
+        if (periodFilter === 'all')
+            return allWalks;
+        const now = Date.now();
+        const periodDays = periodFilter === 'week' ? 7 : 30;
+        const cutoff = now - periodDays * 24 * 60 * 60 * 1000;
+        return allWalks.filter((w) => w.startTime >= cutoff);
+    }, [allWalks, periodFilter]);
+    // 実測クン活スポットTop3の自動クラスタリング集計
+    const topSniffSpots = useMemo(() => {
+        const sniffs = filteredWalks.flatMap((w) => w.actionLogs.filter((l) => l.type === 'sniff_auto' || l.type === 'sniff_manual'));
+        if (sniffs.length === 0)
+            return [];
+        // 緯度経度を小数第4位（約10mメッシュ）でグループ化
+        const clusters = {};
+        for (const log of sniffs) {
+            const key = `${log.lat.toFixed(4)},${log.lng.toFixed(4)}`;
+            if (!clusters[key]) {
+                clusters[key] = { lat: log.lat, lng: log.lng, totalSec: 0, count: 0 };
+            }
+            clusters[key].totalSec += log.durationSec;
+            clusters[key].count += 1;
+        }
+        return Object.values(clusters)
+            .sort((a, b) => b.totalSec - a.totalSec)
+            .slice(0, 3);
+    }, [filteredWalks]);
+    // サマリー・ヒートマップ表示用の安全な中心座標（自宅マスク外の実測ルート重心を優先）
+    const summaryCenter = useMemo(() => {
+        const pts = latestWalk?.routePoints || [];
+        if (pts.length > 0) {
+            const sumLat = pts.reduce((acc, p) => acc + p.lat, 0);
+            const sumLng = pts.reduce((acc, p) => acc + p.lng, 0);
+            return { lat: sumLat / pts.length, lng: sumLng / pts.length };
+        }
+        return {
+            lat: profile?.homeLat ?? currentLat,
+            lng: profile?.homeLng ?? currentLng,
+        };
+    }, [latestWalk, profile, currentLat, currentLng]);
+    const heatmapCenter = useMemo(() => {
+        const pts = filteredWalks.flatMap((w) => w.routePoints);
+        if (pts.length > 0) {
+            const sumLat = pts.reduce((acc, p) => acc + p.lat, 0);
+            const sumLng = pts.reduce((acc, p) => acc + p.lng, 0);
+            return { lat: sumLat / pts.length, lng: sumLng / pts.length };
+        }
+        return {
+            lat: profile?.homeLat ?? currentLat,
+            lng: profile?.homeLng ?? currentLng,
+        };
+    }, [filteredWalks, profile, currentLat, currentLng]);
+    // 防犯保護済みシェア画像（リザルトカード）のCanvas生成・ダウンロード
+    const handleDownloadShareCard = (walk) => {
+        const canvas = document.createElement('canvas');
+        canvas.width = 800;
+        canvas.height = 1000;
+        const ctx = canvas.getContext('2d');
+        if (!ctx)
+            return;
+        // 背景グラデーション
+        const grad = ctx.createLinearGradient(0, 0, 0, 1000);
+        grad.addColorStop(0, '#0f172a');
+        grad.addColorStop(1, '#020617');
+        ctx.fillStyle = grad;
+        ctx.fillRect(0, 0, 800, 1000);
+        // ヘッダー
+        ctx.fillStyle = '#10b981';
+        ctx.font = 'bold 34px sans-serif';
+        ctx.fillText(`🐕 ${profile?.name || '愛犬'}のお散歩＆クン活ログ`, 48, 72);
+        ctx.fillStyle = '#94a3b8';
+        ctx.font = '20px sans-serif';
+        const dateStr = new Date(walk.startTime).toLocaleDateString('ja-JP');
+        ctx.fillText(`${dateStr}  |  🛡️ 自宅周辺マスク保護済（座標・住所非表示）`, 48, 110);
+        // ルート抽象描画ボックス（地図背景を描画せず軌跡形状とクン活ピンのみ描画して自宅特定を完全防止）
+        ctx.fillStyle = '#1e293b';
+        ctx.fillRect(48, 140, 704, 460);
+        ctx.strokeStyle = '#334155';
+        ctx.lineWidth = 2;
+        ctx.strokeRect(48, 140, 704, 460);
+        const pts = walk.routePoints;
+        if (pts.length >= 2) {
+            const lats = pts.map((p) => p.lat);
+            const lngs = pts.map((p) => p.lng);
+            const minLat = Math.min(...lats);
+            const maxLat = Math.max(...lats);
+            const minLng = Math.min(...lngs);
+            const maxLng = Math.max(...lngs);
+            const latSpan = Math.max(maxLat - minLat, 0.0005);
+            const lngSpan = Math.max(maxLng - minLng, 0.0005);
+            const toX = (lng) => 108 + ((lng - minLng) / lngSpan) * 584;
+            const toY = (lat) => 540 - ((lat - minLat) / latSpan) * 340;
+            ctx.strokeStyle = '#10b981';
+            ctx.lineWidth = 6;
+            ctx.lineCap = 'round';
+            ctx.lineJoin = 'round';
+            ctx.beginPath();
+            pts.forEach((p, idx) => {
+                const x = toX(p.lng);
+                const y = toY(p.lat);
+                if (idx === 0)
+                    ctx.moveTo(x, y);
+                else
+                    ctx.lineTo(x, y);
+            });
+            ctx.stroke();
+            // クン活・排泄ピン描画
+            walk.actionLogs.forEach((log) => {
+                const x = toX(log.lng);
+                const y = toY(log.lat);
+                ctx.beginPath();
+                ctx.arc(x, y, log.weight >= 3 ? 10 : 7, 0, Math.PI * 2);
+                ctx.fillStyle =
+                    log.type === 'sniff_manual' || log.type === 'sniff_auto'
+                        ? '#f59e0b'
+                        : log.type === 'pee'
+                            ? '#38bdf8'
+                            : '#a855f7';
+                ctx.fill();
+            });
+        }
+        else {
+            ctx.fillStyle = '#64748b';
+            ctx.font = '22px sans-serif';
+            ctx.fillText('ルート軌跡（防犯マスク外）', 260, 370);
+        }
+        // 4指標パネル
+        const stats = [
+            { label: '移動距離', val: `${walk.distanceMeters} m`, color: '#22d3ee' },
+            { label: 'お散歩時間', val: formatTime(walk.durationSec), color: '#34d399' },
+            { label: 'クン活合計時間', val: formatTime(walk.sniffDurationSec), color: '#fbbf24' },
+            { label: '飼い主消費カロリー', val: `${walk.ownerCaloriesKcal} kcal`, color: '#fb7185' },
+        ];
+        stats.forEach((st, idx) => {
+            const col = idx % 2;
+            const row = Math.floor(idx / 2);
+            const bx = 48 + col * 360;
+            const by = 630 + row * 145;
+            ctx.fillStyle = '#1e293b';
+            ctx.fillRect(bx, by, 344, 125);
+            ctx.fillStyle = '#94a3b8';
+            ctx.font = '20px sans-serif';
+            ctx.fillText(st.label, bx + 24, by + 42);
+            ctx.fillStyle = st.color;
+            ctx.font = 'bold 38px monospace';
+            ctx.fillText(st.val, bx + 24, by + 95);
+        });
+        // PNGとしてダウンロード（Exifなし）
+        const link = document.createElement('a');
+        link.download = `kunkatsu_share_${walk.id}.png`;
+        link.href = canvas.toDataURL('image/png');
+        link.click();
+    };
+    return (React.createElement("main", { className: `min-h-screen ${darkMode ? 'bg-slate-950 text-slate-100' : 'bg-slate-50 text-slate-900'} pb-20 select-none` },
+        pocketLock && (React.createElement("div", { className: "fixed inset-0 z-50 bg-black flex flex-col items-center justify-between p-8 text-neutral-400 select-none" },
+            React.createElement("div", { className: "text-center pt-8" },
+                React.createElement("span", { className: "text-3xl" }, "\uD83D\uDD12"),
+                React.createElement("h2", { className: "text-sm font-semibold tracking-widest mt-2 text-neutral-300" }, "POCKET LOCK"),
+                React.createElement("p", { className: "text-[11px] text-neutral-600 mt-1" }, "\u5E38\u6642\u70B9\u706F\u30FB\u6709\u6A5FEL\u7701\u96FB\u529B\u4E2D\uFF08\u8AA4\u30BF\u30C3\u30D7\u9632\u6B62\uFF09")),
+            React.createElement("div", { className: "grid grid-cols-3 gap-4 text-center my-auto w-full max-w-xs" },
+                React.createElement("div", null,
+                    React.createElement("span", { className: "text-[10px] text-neutral-600 uppercase" }, "\u6642\u9593"),
+                    React.createElement("p", { className: "text-lg font-mono font-bold text-neutral-400" }, formatTime(elapsedSec))),
+                React.createElement("div", null,
+                    React.createElement("span", { className: "text-[10px] text-neutral-600 uppercase" }, "\u8DDD\u96E2"),
+                    React.createElement("p", { className: "text-lg font-mono font-bold text-neutral-400" },
+                        distanceMeters,
+                        "m")),
+                React.createElement("div", null,
+                    React.createElement("span", { className: "text-[10px] text-neutral-600 uppercase" }, "\u30AF\u30F3\u6D3B"),
+                    React.createElement("p", { className: "text-lg font-mono font-bold text-neutral-400" }, formatTime(sniffTotalSec)))),
+            React.createElement("div", { className: "w-full max-w-xs pb-12" },
+                React.createElement("div", { className: "relative overflow-hidden rounded-2xl border border-neutral-800 bg-neutral-900" },
+                    React.createElement("div", { className: "absolute inset-0 bg-emerald-700 transition-all duration-75 pointer-events-none", style: { width: `${unlockProgress}%` } }),
+                    React.createElement("button", { onMouseDown: handleUnlockHoldStart, onMouseUp: handleUnlockHoldEnd, onTouchStart: handleUnlockHoldStart, onTouchEnd: handleUnlockHoldEnd, className: "relative w-full py-4 text-xs font-bold uppercase tracking-wider text-neutral-200 text-center" },
+                        "\u9577\u62BC\u3057\u3067\u30ED\u30C3\u30AF\u89E3\u9664 (",
+                        unlockProgress,
+                        "%)"))))),
+        React.createElement("header", { className: "px-4 py-3 border-b border-slate-800/40 flex justify-between items-center backdrop-blur bg-slate-900/60 sticky top-0 z-30" },
+            React.createElement("div", { className: "flex items-center gap-2" },
+                React.createElement("span", { className: "text-xl" }, "\uD83D\uDC15"),
+                React.createElement("h1", { className: "font-bold text-base tracking-wide" }, "\u30AF\u30F3\u6D3B\u30ED\u30B0"),
+                React.createElement("span", { className: "text-xs px-2 py-0.5 rounded-full bg-emerald-500/20 text-emerald-400 font-medium" }, "MVP")),
+            React.createElement("div", { className: "flex items-center gap-2" },
+                isWalking && (React.createElement("button", { onClick: () => setPocketLock(true), className: "px-2.5 py-1 rounded-lg bg-amber-500/20 border border-amber-500/40 text-amber-300 text-xs font-semibold flex items-center gap-1" },
+                    React.createElement("span", null, "\uD83D\uDD12"),
+                    " \u30DD\u30B1\u30C3\u30C8\u30ED\u30C3\u30AF")),
+                React.createElement("button", { onClick: () => setDarkMode(!darkMode), className: "p-2 rounded-lg bg-slate-800/80 text-xs text-slate-300", title: "\u30C6\u30FC\u30DE\u5207\u66FF" }, darkMode ? '☀️' : '🌙'))),
+        activeTab === 'walk' && (React.createElement("section", { className: "p-4 flex flex-col gap-3" },
+            React.createElement("div", { className: "grid grid-cols-3 gap-2 bg-slate-900/80 p-3 rounded-2xl border border-slate-800" },
+                React.createElement("div", { className: "text-center" },
+                    React.createElement("span", { className: "text-[10px] text-slate-400 uppercase tracking-wider" }, "\u6563\u6B69\u6642\u9593"),
+                    React.createElement("p", { className: "text-xl font-bold font-mono text-emerald-400" }, formatTime(elapsedSec))),
+                React.createElement("div", { className: "text-center border-x border-slate-800" },
+                    React.createElement("span", { className: "text-[10px] text-slate-400 uppercase tracking-wider" }, "\u79FB\u52D5\u8DDD\u96E2"),
+                    React.createElement("p", { className: "text-xl font-bold font-mono text-cyan-400" },
+                        distanceMeters,
+                        "m")),
+                React.createElement("div", { className: "text-center" },
+                    React.createElement("span", { className: "text-[10px] text-slate-400 uppercase tracking-wider" }, "\u30AF\u30F3\u6D3B\u6642\u9593"),
+                    React.createElement("p", { className: "text-xl font-bold font-mono text-amber-400" }, formatTime(sniffTotalSec)))),
+            React.createElement("div", { className: "h-64 w-full" },
+                React.createElement(DualMap, { engine: mapEngine, mapboxToken: profile?.mapboxPublicToken || '', darkMode: darkMode, centerLat: currentLat, centerLng: currentLng, routePoints: routePoints, actionLogs: actionLogs, activeLayer: "sniff" })),
+            geofenceMaskedCount > 0 && (React.createElement("p", { className: "text-[11px] text-slate-400 text-center" },
+                "\uD83D\uDEE1\uFE0F \u81EA\u5B85\u30DE\u30B9\u30AF\u7BC4\u56F2\u5185: ",
+                geofenceMaskedCount,
+                " \u500B\u306E\u5EA7\u6A19\u3092\u975E\u516C\u958B\u9664\u5916\u4E2D")),
+            !isWalking ? (React.createElement("div", { className: "flex flex-col gap-2 mt-2" },
+                React.createElement("button", { onClick: () => startWalk(false), className: "w-full py-4 bg-emerald-600 hover:bg-emerald-500 active:scale-95 transition rounded-2xl font-bold text-lg shadow-lg shadow-emerald-900/40 text-white" }, "\uD83D\uDC3E \u304A\u6563\u6B69\u30B9\u30BF\u30FC\u30C8"),
+                React.createElement("button", { onClick: () => startWalk(true), className: "w-full py-2 bg-slate-800 hover:bg-slate-700 active:scale-95 transition rounded-xl text-xs text-slate-300" }, "\uD83E\uDDEA \u5BA4\u5185\u7528GPS\u30B7\u30DF\u30E5\u30EC\u30FC\u30BF\u30FC\u3067\u958B\u59CB"))) : (React.createElement("div", { className: "flex flex-col gap-2.5 mt-1" },
+                undoTargetId && (React.createElement("div", { className: "flex items-center justify-between p-2.5 bg-slate-800 border border-slate-700 rounded-xl" },
+                    React.createElement("span", { className: "text-xs text-slate-300" }, "\u884C\u52D5\u3092\u8A18\u9332\u3057\u307E\u3057\u305F"),
+                    React.createElement("button", { onClick: handleUndoLastAction, className: "text-xs bg-slate-700 hover:bg-slate-600 px-3 py-1 rounded text-amber-400 font-semibold" }, "\u5143\u306B\u623B\u3059 (3s)"))),
+                showPoopSelectorForId && (React.createElement("div", { className: "p-2.5 bg-slate-900 border border-purple-500/40 rounded-xl flex items-center justify-between gap-2" },
+                    React.createElement("span", { className: "text-xs text-purple-300" }, "\u3046\u3093\u3061\u306E\u72B6\u614B:"),
+                    React.createElement("div", { className: "flex gap-1.5" },
+                        React.createElement("button", { onClick: () => handleSelectPoopCondition('normal'), className: "px-2.5 py-1 text-xs bg-purple-600/30 hover:bg-purple-600 text-purple-200 rounded font-medium" }, "\u5FEB\u4FBF"),
+                        React.createElement("button", { onClick: () => handleSelectPoopCondition('soft'), className: "px-2.5 py-1 text-xs bg-purple-600/30 hover:bg-purple-600 text-purple-200 rounded font-medium" }, "\u8EDF\u4FBF"),
+                        React.createElement("button", { onClick: () => handleSelectPoopCondition('hard'), className: "px-2.5 py-1 text-xs bg-purple-600/30 hover:bg-purple-600 text-purple-200 rounded font-medium" }, "\u786C\u3081")))),
+                React.createElement("button", { onClick: () => handleManualAction('sniff_manual'), className: "w-full py-5 bg-gradient-to-r from-amber-500 to-amber-600 active:scale-95 transition rounded-2xl font-extrabold text-xl shadow-lg shadow-amber-900/40 text-black flex items-center justify-center gap-2" },
+                    React.createElement("span", null, "\uD83D\uDC43"),
+                    React.createElement("span", null, "\u30AF\u30F3\u6D3B\uFF01")),
+                React.createElement("div", { className: "grid grid-cols-2 gap-2" },
+                    React.createElement("button", { onClick: () => handleManualAction('pee'), className: "py-4 bg-sky-600 hover:bg-sky-500 active:scale-95 transition rounded-2xl font-bold text-base text-white flex items-center justify-center gap-1.5" },
+                        React.createElement("span", null, "\uD83D\uDCA7"),
+                        React.createElement("span", null, "\u304A\u3057\u3063\u3053")),
+                    React.createElement("button", { onClick: () => handleManualAction('poop'), className: "py-4 bg-purple-700 hover:bg-purple-600 active:scale-95 transition rounded-2xl font-bold text-base text-white flex items-center justify-center gap-1.5" },
+                        React.createElement("span", null, "\uD83D\uDCA9"),
+                        React.createElement("span", null, "\u3046\u3093\u3061"))),
+                React.createElement("div", { className: "relative overflow-hidden rounded-xl border border-rose-900/50 mt-1" },
+                    React.createElement("div", { className: "absolute inset-0 bg-rose-600 transition-all duration-75 pointer-events-none", style: { width: `${stopHoldProgress}%` } }),
+                    React.createElement("button", { onMouseDown: handleStopHoldStart, onMouseUp: handleStopHoldEnd, onTouchStart: handleStopHoldStart, onTouchEnd: handleStopHoldEnd, className: "relative w-full py-3 bg-slate-900/90 text-rose-400 font-bold text-xs uppercase tracking-wider text-center" },
+                        "\u9577\u62BC\u3057\u3067\u6563\u6B69\u7D42\u4E86 (",
+                        stopHoldProgress,
+                        "%)")))))),
+        activeTab === 'summary' && (React.createElement("section", { className: "p-4 flex flex-col gap-4" },
+            React.createElement("h2", { className: "text-base font-bold flex items-center gap-2" },
+                React.createElement("span", null, "\uD83C\uDFC1"),
+                " \u76F4\u8FD1\u306E\u304A\u6563\u6B69\u30B5\u30DE\u30EA\u30FC"),
+            latestWalk ? (React.createElement("div", { className: "bg-slate-900 p-4 rounded-2xl border border-slate-800 flex flex-col gap-3" },
+                React.createElement("div", { className: "h-56 w-full" },
+                    React.createElement(DualMap, { engine: mapEngine, mapboxToken: profile?.mapboxPublicToken || '', darkMode: darkMode, centerLat: summaryCenter.lat, centerLng: summaryCenter.lng, routePoints: latestWalk.routePoints, actionLogs: latestWalk.actionLogs, activeLayer: "sniff" })),
+                React.createElement("div", { className: "grid grid-cols-2 gap-2 text-xs" },
+                    React.createElement("div", { className: "p-2 bg-slate-800/50 rounded-lg" },
+                        React.createElement("span", { className: "text-slate-400" }, "\u79FB\u52D5\u8DDD\u96E2"),
+                        React.createElement("p", { className: "text-sm font-bold text-cyan-400" },
+                            latestWalk.distanceMeters,
+                            " m")),
+                    React.createElement("div", { className: "p-2 bg-slate-800/50 rounded-lg" },
+                        React.createElement("span", { className: "text-slate-400" }, "\u6563\u6B69\u6642\u9593"),
+                        React.createElement("p", { className: "text-sm font-bold text-emerald-400" }, formatTime(latestWalk.durationSec))),
+                    React.createElement("div", { className: "p-2 bg-slate-800/50 rounded-lg" },
+                        React.createElement("span", { className: "text-slate-400" }, "\u30AF\u30F3\u6D3B\u5408\u8A08\u6642\u9593"),
+                        React.createElement("p", { className: "text-sm font-bold text-amber-400" }, formatTime(latestWalk.sniffDurationSec))),
+                    React.createElement("div", { className: "p-2 bg-slate-800/50 rounded-lg" },
+                        React.createElement("span", { className: "text-slate-400" }, "\u98FC\u3044\u4E3B\u6D88\u8CBB\u30AB\u30ED\u30EA\u30FC"),
+                        React.createElement("p", { className: "text-sm font-bold text-rose-400" },
+                            latestWalk.ownerCaloriesKcal,
+                            " kcal"))),
+                React.createElement("div", { className: "flex flex-col gap-1 mt-1" },
+                    React.createElement("label", { className: "text-xs text-slate-400" }, "\u304A\u6563\u6B69\u5199\u771F\u3092\u8FFD\u52A0\uFF08Exif\u81EA\u52D5\u524A\u9664\uFF09"),
+                    React.createElement("input", { type: "file", accept: "image/*", onChange: async (e) => {
+                            const file = e.target.files?.[0];
+                            if (file && latestWalk) {
+                                const safeUrl = await stripImageExifAndResize(file);
+                                const updated = { ...latestWalk, safePhotoDataUrl: safeUrl };
+                                await saveWalkSession(updated);
+                                setLatestWalk(updated);
+                            }
+                        }, className: "text-xs text-slate-400 file:mr-2 file:py-1 file:px-3 file:rounded file:border-0 file:text-xs file:bg-slate-800 file:text-slate-200" }),
+                    latestWalk.safePhotoDataUrl && (React.createElement("img", { src: latestWalk.safePhotoDataUrl, alt: "Sanitized Dog Photo", className: "w-full h-40 object-cover rounded-xl mt-2 border border-slate-700" }))),
+                React.createElement("button", { onClick: () => handleDownloadShareCard(latestWalk), className: "w-full py-2.5 bg-emerald-600 hover:bg-emerald-500 active:scale-95 transition rounded-xl font-bold text-xs text-white mt-1" }, "\uD83D\uDCF8 \u30B7\u30A7\u30A2\u7528\u30EA\u30B6\u30EB\u30C8\u753B\u50CF\u3092\u4FDD\u5B58\uFF08\u81EA\u5B85\u5468\u8FBA\u30FB\u5730\u56F3\u80CC\u666F\u9664\u5916\u6E08\uFF09"))) : (React.createElement("p", { className: "text-xs text-slate-500 text-center py-10" }, "\u307E\u3060\u6563\u6B69\u8A18\u9332\u304C\u3042\u308A\u307E\u305B\u3093\u3002")))),
+        activeTab === 'heatmap' && (React.createElement("section", { className: "p-4 flex flex-col gap-3" },
+            React.createElement("h2", { className: "text-base font-bold flex items-center gap-2" },
+                React.createElement("span", null, "\uD83D\uDDFA\uFE0F"),
+                " \u30DE\u30A4\u30FB\u30D2\u30FC\u30C8\u30DE\u30C3\u30D7"),
+            React.createElement("div", { className: "grid grid-cols-3 gap-1 bg-slate-900 p-1 rounded-xl text-xs" }, ['week', 'month', 'all'].map((p) => (React.createElement("button", { key: p, onClick: () => setPeriodFilter(p), className: `py-1.5 rounded-lg capitalize ${periodFilter === p ? 'bg-slate-700 font-bold text-white' : 'text-slate-400'}` }, p === 'week' ? '直近1週間' : p === 'month' ? '直近1ヶ月' : '全期間')))),
+            React.createElement("div", { className: "grid grid-cols-3 gap-1 bg-slate-900 p-1 rounded-xl text-xs" },
+                React.createElement("button", { onClick: () => setHeatmapLayer('sniff'), className: `py-1.5 rounded-lg ${heatmapLayer === 'sniff' ? 'bg-amber-600 font-bold text-black' : 'text-slate-400'}` }, "\uD83D\uDC43 \u30AF\u30F3\u6D3B"),
+                React.createElement("button", { onClick: () => setHeatmapLayer('excretion'), className: `py-1.5 rounded-lg ${heatmapLayer === 'excretion' ? 'bg-sky-600 font-bold text-white' : 'text-slate-400'}` }, "\uD83D\uDCA7 \u6392\u6CC4"),
+                React.createElement("button", { onClick: () => setHeatmapLayer('route'), className: `py-1.5 rounded-lg ${heatmapLayer === 'route' ? 'bg-emerald-600 font-bold text-white' : 'text-slate-400'}` }, "\uD83D\uDEE3\uFE0F \u30EB\u30FC\u30C8\u5BC6\u5EA6")),
+            React.createElement("div", { className: "h-80 w-full" },
+                React.createElement(DualMap, { engine: mapEngine, mapboxToken: profile?.mapboxPublicToken || '', darkMode: darkMode, centerLat: heatmapCenter.lat, centerLng: heatmapCenter.lng, routePoints: filteredWalks.flatMap((w) => w.routePoints), actionLogs: filteredWalks.flatMap((w) => w.actionLogs), activeLayer: heatmapLayer })),
+            React.createElement("div", { className: "p-3 bg-slate-900 rounded-xl border border-slate-800 text-xs" },
+                React.createElement("span", { className: "font-semibold text-slate-300" }, "\uD83D\uDCA1 \u304A\u6C17\u306B\u5165\u308A\u30AF\u30F3\u6D3B\u30B9\u30DD\u30C3\u30C8 Top3"),
+                topSniffSpots.length > 0 ? (React.createElement("ol", { className: "list-decimal list-inside text-slate-400 mt-1 flex flex-col gap-0.5" }, topSniffSpots.map((spot, idx) => (React.createElement("li", { key: idx },
+                    "\u5730\u70B9 #",
+                    idx + 1,
+                    "\uFF08\u5408\u8A08\u6EDE\u5728 ",
+                    formatTime(spot.totalSec),
+                    " / \u8A18\u9332 ",
+                    spot.count,
+                    " \u56DE\uFF09"))))) : (React.createElement("p", { className: "text-slate-500 text-[11px] mt-1" }, "\u6563\u6B69\u8A18\u9332\u304B\u3089\u81EA\u52D5\u7684\u306B\u983B\u51FA\u30B9\u30DD\u30C3\u30C8\u304C\u96C6\u8A08\u3055\u308C\u307E\u3059\u3002"))))),
+        activeTab === 'settings' && profile && (React.createElement("section", { className: "p-4 flex flex-col gap-3 text-xs" },
+            React.createElement("h2", { className: "text-base font-bold flex items-center gap-2" },
+                React.createElement("span", null, "\u2699\uFE0F"),
+                " \u8A2D\u5B9A\u30FB\u30D7\u30E9\u30A4\u30D0\u30B7\u30FC\u4FDD\u8B77"),
+            React.createElement("div", { className: "p-3 bg-slate-900 rounded-xl border border-slate-800 flex flex-col gap-2" },
+                React.createElement("h3", { className: "font-semibold text-slate-200" }, "\uD83D\uDEE1\uFE0F \u81EA\u5B85\u7279\u5B9A\u9632\u6B62\u30B8\u30AA\u30D5\u30A7\u30F3\u30B9"),
+                React.createElement("p", { className: "text-slate-400 text-[11px]" }, "\u81EA\u5B85\u304B\u3089\u6307\u5B9A\u534A\u5F84\u5185\u306EGPS\u8A18\u9332\u3092\u30D6\u30E9\u30A6\u30B6\u5074\u3067\u5373\u6642\u7834\u68C4\u3057\u307E\u3059\u3002 \u767B\u9332\u6642\u306B\u4E2D\u5FC3\u5EA7\u6A19\u307830\u301C70m\u306E\u30E9\u30F3\u30C0\u30E0\u30AA\u30D5\u30BB\u30C3\u30C8\u304C\u9069\u7528\u3055\u308C\u308B\u305F\u3081\u3001\u7A7A\u767D\u5186\u306E\u4E2D\u5FC3\u304B\u3089\u81EA\u5B85\u304C\u9006\u7B97\u3055\u308C\u308B\u306E\u3092\u9632\u304E\u307E\u3059\u3002"),
+                React.createElement("div", { className: "flex items-center gap-2" },
+                    React.createElement("label", { className: "text-slate-400" }, "\u30DE\u30B9\u30AF\u534A\u5F84:"),
+                    React.createElement("input", { type: "number", min: 150, value: profile.geofenceRadiusMeters, onChange: (e) => {
+                            const val = Math.max(150, Number(e.target.value));
+                            setProfile({ ...profile, geofenceRadiusMeters: val });
+                        }, className: "w-20 px-2 py-1 bg-slate-800 rounded border border-slate-700 text-white" }),
+                    React.createElement("span", null, "\u30E1\u30FC\u30C8\u30EB (\u4E0B\u9650150m)")),
+                React.createElement("button", { onClick: () => {
+                        const registerWithOffset = (rawLat, rawLng) => {
+                            const { offsetLat, offsetLng } = applyHomeRandomOffset(rawLat, rawLng);
+                            setProfile({ ...profile, homeLat: offsetLat, homeLng: offsetLng });
+                            setCurrentLat(offsetLat);
+                            setCurrentLng(offsetLng);
+                            alert('防犯のため、現在地から30〜70mランダムにずらした中心座標として安全に登録しました（真の自宅生座標は破棄されました）');
+                        };
+                        if ('geolocation' in navigator) {
+                            navigator.geolocation.getCurrentPosition((pos) => registerWithOffset(pos.coords.latitude, pos.coords.longitude), () => registerWithOffset(currentLat, currentLng));
+                        }
+                        else {
+                            registerWithOffset(currentLat, currentLng);
+                        }
+                    }, className: "py-1.5 px-3 bg-slate-800 hover:bg-slate-700 rounded text-slate-200 w-fit" }, "\u73FE\u5728\u5730\u3092\u81EA\u5B85\u5EA7\u6A19\u306B\u30BB\u30C3\u30C8\uFF08\u30E9\u30F3\u30C0\u30E0\u30AA\u30D5\u30BB\u30C3\u30C8\u9069\u7528\uFF09"),
+                profile.homeLat !== null && (React.createElement("span", { className: "text-[10px] text-emerald-400" }, "\u2705 \u30AA\u30D5\u30BB\u30C3\u30C8\u4E2D\u5FC3\u5EA7\u6A19\u304C\u767B\u9332\u3055\u308C\u3066\u3044\u307E\u3059"))),
+            React.createElement("div", { className: "p-3 bg-slate-900 rounded-xl border border-slate-800 flex flex-col gap-2" },
+                React.createElement("h3", { className: "font-semibold text-slate-200" }, "\uD83D\uDDFA\uFE0F \u5730\u56F3\u30A8\u30F3\u30B8\u30F3\u5207\u66FF\uFF08\u6BD4\u8F03\u691C\u8A3C\uFF09"),
+                React.createElement("div", { className: "flex gap-2" },
+                    React.createElement("button", { onClick: () => setMapEngine('osm'), className: `flex-1 py-2 rounded-lg ${mapEngine === 'osm' ? 'bg-emerald-600 font-bold text-white' : 'bg-slate-800 text-slate-400'}` }, "OpenStreetMap (\u7121\u6599)"),
+                    React.createElement("button", { onClick: () => setMapEngine('mapbox'), className: `flex-1 py-2 rounded-lg ${mapEngine === 'mapbox' ? 'bg-cyan-600 font-bold text-white' : 'bg-slate-800 text-slate-400'}` }, "Mapbox GL JS")),
+                React.createElement("input", { type: "text", placeholder: "Mapbox Public Token (pk....)", value: profile.mapboxPublicToken, onChange: (e) => setProfile({ ...profile, mapboxPublicToken: e.target.value }), className: "w-full px-2.5 py-1.5 bg-slate-800 rounded border border-slate-700 text-white text-[11px]" })),
+            React.createElement("div", { className: "p-3 bg-slate-900 rounded-xl border border-slate-800 flex flex-col gap-2" },
+                React.createElement("h3", { className: "font-semibold text-slate-200" }, "\uD83E\uDDEA \u30C7\u30E2\u7528\u30E2\u30C3\u30AF\u30C7\u30FC\u30BF\u751F\u6210"),
+                React.createElement("button", { onClick: async () => {
+                        await seedDemoWalkData(currentLat, currentLng);
+                        const walks = await getAllWalks();
+                        setAllWalks(walks);
+                        alert('デモ散歩データを IndexedDB に生成しました！');
+                    }, className: "py-2 bg-slate-800 hover:bg-slate-700 rounded-lg text-amber-400 font-semibold" }, "\u6563\u6B69\uFF06\u30AF\u30F3\u6D3B\u30C7\u30E2\u30C7\u30FC\u30BF\u3092\u6CE8\u5165")),
+            React.createElement("button", { onClick: async () => {
+                    await saveDogProfile(profile);
+                    alert('設定を端末内ローカルに保存しました');
+                }, className: "w-full py-3 bg-emerald-600 text-white font-bold rounded-xl mt-2" }, "\u8A2D\u5B9A\u3092\u4FDD\u5B58"))),
+        React.createElement("nav", { className: "fixed bottom-0 inset-x-0 bg-slate-900/95 border-t border-slate-800 backdrop-blur flex justify-around items-center py-2 z-40" },
+            React.createElement("button", { onClick: () => setActiveTab('walk'), className: `flex flex-col items-center gap-0.5 text-xs ${activeTab === 'walk' ? 'text-emerald-400 font-bold' : 'text-slate-400'}` },
+                React.createElement("span", null, "\uD83D\uDC3E"),
+                React.createElement("span", null, "\u304A\u6563\u6B69")),
+            React.createElement("button", { onClick: () => setActiveTab('summary'), className: `flex flex-col items-center gap-0.5 text-xs ${activeTab === 'summary' ? 'text-emerald-400 font-bold' : 'text-slate-400'}` },
+                React.createElement("span", null, "\uD83C\uDFC1"),
+                React.createElement("span", null, "\u30B5\u30DE\u30EA\u30FC")),
+            React.createElement("button", { onClick: () => setActiveTab('heatmap'), className: `flex flex-col items-center gap-0.5 text-xs ${activeTab === 'heatmap' ? 'text-emerald-400 font-bold' : 'text-slate-400'}` },
+                React.createElement("span", null, "\uD83D\uDDFA\uFE0F"),
+                React.createElement("span", null, "\u30D2\u30FC\u30C8\u30DE\u30C3\u30D7")),
+            React.createElement("button", { onClick: () => setActiveTab('settings'), className: `flex flex-col items-center gap-0.5 text-xs ${activeTab === 'settings' ? 'text-emerald-400 font-bold' : 'text-slate-400'}` },
+                React.createElement("span", null, "\u2699\uFE0F"),
+                React.createElement("span", null, "\u8A2D\u5B9A")))));
+}
+// --- Mount App ---
+const rootElement = document.getElementById("root");
+if (rootElement) {
+    ReactDOM.createRoot(rootElement).render(React.createElement(KunKatsuApp));
+}
+
+  </script>
+</body>
+</html>
