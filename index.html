@@ -33,7 +33,8 @@
 <body>
   <div id="root"></div>
   <script>
-const { useState, useEffect, useRef, useMemo } = React;
+const { useState, useEffect, useRef, useMemo, useCallback } = React;
+
 // --- security.ts ---
 /**
  * 2点間の距離（メートル）をHaversine公式で算出
@@ -134,6 +135,8 @@ async function stripImageExifAndResize(file, maxWidth = 1080) {
         img.src = objectUrl;
     });
 }
+
+
 // --- db.ts ---
 const DB_NAME = 'KunKatsuLocalDB';
 const DB_VERSION = 1;
@@ -181,6 +184,7 @@ async function getDogProfile() {
                     homeLng: null,
                     geofenceRadiusMeters: 200, // 確定仕様: 初期値200m (下限150m)
                     mapboxPublicToken: '',
+                    soundFeedbackEnabled: false,
                 };
                 resolve(defaultProfile);
             }
@@ -287,6 +291,135 @@ async function seedDemoWalkData(baseLat, baseLng) {
     };
     await saveWalkSession(demoWalk);
 }
+
+
+// --- shareCard.ts ---
+function formatDuration(totalSec) {
+    const mins = Math.floor(totalSec / 60);
+    const secs = totalSec % 60;
+    return `${mins.toString().padStart(2, '0')}:${secs.toString().padStart(2, '0')}`;
+}
+/**
+ * 防犯保護済みシェア画像（リザルトカード）のCanvas生成・Blob変換関数
+ * - 地図背景を描画せず、防犯マスク外の抽象ルート軌跡とアクションピンのみを描画
+ * - Exif等の位置情報メタデータを含まないクリーンなPNG Blobを出力
+ */
+function generateShareCardBlob(walk, dogName = '愛犬') {
+    return new Promise((resolve, reject) => {
+        try {
+            const canvas = document.createElement('canvas');
+            canvas.width = 800;
+            canvas.height = 1000;
+            const ctx = canvas.getContext('2d');
+            if (!ctx) {
+                reject(new Error('Canvas 2D context is not available'));
+                return;
+            }
+            // 背景グラデーション
+            const grad = ctx.createLinearGradient(0, 0, 0, 1000);
+            grad.addColorStop(0, '#0f172a');
+            grad.addColorStop(1, '#020617');
+            ctx.fillStyle = grad;
+            ctx.fillRect(0, 0, 800, 1000);
+            // ヘッダー
+            ctx.fillStyle = '#10b981';
+            ctx.font = 'bold 34px sans-serif';
+            ctx.fillText(`🐕 ${dogName}のお散歩＆クン活ログ`, 48, 72);
+            ctx.fillStyle = '#94a3b8';
+            ctx.font = '20px sans-serif';
+            const dateStr = new Date(walk.startTime).toLocaleDateString('ja-JP');
+            ctx.fillText(`${dateStr}  |  🛡️ 自宅周辺マスク保護済（座標・住所非表示）`, 48, 110);
+            // ルート抽象描画ボックス（地図背景を描画せず軌跡形状とクン活ピンのみ描画して自宅特定を完全防止）
+            ctx.fillStyle = '#1e293b';
+            ctx.fillRect(48, 140, 704, 460);
+            ctx.strokeStyle = '#334155';
+            ctx.lineWidth = 2;
+            ctx.strokeRect(48, 140, 704, 460);
+            const pts = walk.routePoints;
+            if (pts.length >= 2) {
+                const lats = pts.map((p) => p.lat);
+                const lngs = pts.map((p) => p.lng);
+                const minLat = Math.min(...lats);
+                const maxLat = Math.max(...lats);
+                const minLng = Math.min(...lngs);
+                const maxLng = Math.max(...lngs);
+                const latSpan = Math.max(maxLat - minLat, 0.0005);
+                const lngSpan = Math.max(maxLng - minLng, 0.0005);
+                const toX = (lng) => 108 + ((lng - minLng) / lngSpan) * 584;
+                const toY = (lat) => 540 - ((lat - minLat) / latSpan) * 340;
+                ctx.strokeStyle = '#10b981';
+                ctx.lineWidth = 6;
+                ctx.lineCap = 'round';
+                ctx.lineJoin = 'round';
+                ctx.beginPath();
+                pts.forEach((p, idx) => {
+                    const x = toX(p.lng);
+                    const y = toY(p.lat);
+                    if (idx === 0)
+                        ctx.moveTo(x, y);
+                    else
+                        ctx.lineTo(x, y);
+                });
+                ctx.stroke();
+                // クン活・排泄ピン描画
+                walk.actionLogs.forEach((log) => {
+                    const x = toX(log.lng);
+                    const y = toY(log.lat);
+                    ctx.beginPath();
+                    ctx.arc(x, y, log.weight >= 3 ? 10 : 7, 0, Math.PI * 2);
+                    ctx.fillStyle =
+                        log.type === 'sniff_manual' || log.type === 'sniff_auto'
+                            ? '#f59e0b'
+                            : log.type === 'pee'
+                                ? '#38bdf8'
+                                : '#a855f7';
+                    ctx.fill();
+                });
+            }
+            else {
+                ctx.fillStyle = '#64748b';
+                ctx.font = '22px sans-serif';
+                ctx.fillText('ルート軌跡（防犯マスク外）', 260, 370);
+            }
+            // 4指標パネル
+            const stats = [
+                { label: '移動距離', val: `${walk.distanceMeters} m`, color: '#22d3ee' },
+                { label: 'お散歩時間', val: formatDuration(walk.durationSec), color: '#34d399' },
+                { label: 'クン活合計時間', val: formatDuration(walk.sniffDurationSec), color: '#fbbf24' },
+                { label: '飼い主消費カロリー', val: `${walk.ownerCaloriesKcal} kcal`, color: '#fb7185' },
+            ];
+            stats.forEach((st, idx) => {
+                const col = idx % 2;
+                const row = Math.floor(idx / 2);
+                const bx = 48 + col * 360;
+                const by = 630 + row * 145;
+                ctx.fillStyle = '#1e293b';
+                ctx.fillRect(bx, by, 344, 125);
+                ctx.fillStyle = '#94a3b8';
+                ctx.font = '20px sans-serif';
+                ctx.fillText(st.label, bx + 24, by + 42);
+                ctx.fillStyle = st.color;
+                ctx.font = 'bold 38px monospace';
+                ctx.fillText(st.val, bx + 24, by + 95);
+            });
+            // Canvas から PNG Blob を生成
+            canvas.toBlob((blob) => {
+                if (blob) {
+                    resolve(blob);
+                }
+                else {
+                    reject(new Error('Canvas toBlob returned null'));
+                }
+            }, 'image/png');
+        }
+        catch (error) {
+            reject(error);
+        }
+    });
+}
+
+
+// --- DualMap.tsx ---
 function DualMap({ engine, mapboxToken, darkMode, centerLat, centerLng, routePoints, actionLogs, activeLayer, }) {
     const containerRef = useRef(null);
     const mapInstanceRef = useRef(null);
@@ -539,15 +672,315 @@ function DualMap({ engine, mapboxToken, darkMode, centerLat, centerLng, routePoi
                 tileProvider === 'osm' ? '地理院へ' : 'OSMへ',
                 ")")))));
 }
+
+
+// --- SlideToUnlock.tsx ---
+const THUMB_SIZE = 48; // px
+const UNLOCK_THRESHOLD_RATIO = 0.8; // 可動域の80%以上で解除
+const MAX_VERTICAL_DRIFT_PX = 40; // 縦ブレ許容40px以内
+const MAX_SLIDE_DURATION_MS = 2000; // 2秒以内に完了しない場合はキャンセル
+function SlideToUnlock({ onUnlock }) {
+    const trackRef = useRef(null);
+    const timeoutRef = useRef(null);
+    const [dragX, setDragX] = useState(0);
+    const [isDragging, setIsDragging] = useState(false);
+    // ドラッグ中の基準情報（再レンダリング不要な同期参照用）
+    const dragStateRef = useRef({
+        active: false,
+        startX: 0,
+        startY: 0,
+        maxSlidePx: 200,
+    });
+    const clearSlideTimeout = useCallback(() => {
+        if (timeoutRef.current) {
+            clearTimeout(timeoutRef.current);
+            timeoutRef.current = null;
+        }
+    }, []);
+    const cancelDrag = useCallback(() => {
+        clearSlideTimeout();
+        dragStateRef.current.active = false;
+        setIsDragging(false);
+        setDragX(0);
+    }, [clearSlideTimeout]);
+    useEffect(() => {
+        return () => {
+            clearSlideTimeout();
+        };
+    }, [clearSlideTimeout]);
+    const getMaxSlidePx = () => {
+        if (!trackRef.current)
+            return 200;
+        // 左右パディング(4px * 2 = 8px)とつまみ幅(48px)を差し引いた可動距離
+        return Math.max(trackRef.current.clientWidth - THUMB_SIZE - 8, 80);
+    };
+    const startDrag = useCallback((clientX, clientY) => {
+        clearSlideTimeout();
+        const maxSlidePx = getMaxSlidePx();
+        dragStateRef.current = {
+            active: true,
+            startX: clientX,
+            startY: clientY,
+            maxSlidePx,
+        };
+        setIsDragging(true);
+        setDragX(0);
+        // 2秒制限タイマー：時間内に解除できなければ即キャンセル（太腿の持続接触対策）
+        timeoutRef.current = setTimeout(() => {
+            if (dragStateRef.current.active) {
+                cancelDrag();
+            }
+        }, MAX_SLIDE_DURATION_MS);
+    }, [cancelDrag, clearSlideTimeout]);
+    const moveDrag = useCallback((clientX, clientY) => {
+        const state = dragStateRef.current;
+        if (!state.active)
+            return;
+        // 縦方向のブレ判定（40pxを超えたら即キャンセル）
+        const deltaY = Math.abs(clientY - state.startY);
+        if (deltaY > MAX_VERTICAL_DRIFT_PX) {
+            cancelDrag();
+            return;
+        }
+        const rawDeltaX = clientX - state.startX;
+        const clampedX = Math.max(0, Math.min(rawDeltaX, state.maxSlidePx));
+        setDragX(clampedX);
+        // 80%以上に到達したら即座にロック解除
+        if (clampedX >= state.maxSlidePx * UNLOCK_THRESHOLD_RATIO) {
+            clearSlideTimeout();
+            dragStateRef.current.active = false;
+            setIsDragging(false);
+            setDragX(0);
+            onUnlock();
+        }
+    }, [cancelDrag, clearSlideTimeout, onUnlock]);
+    // タッチ開始（つまみ上でのみ発火。2本指以上は即拒否）
+    const handleThumbTouchStart = (e) => {
+        e.stopPropagation();
+        if (e.touches.length !== 1) {
+            cancelDrag();
+            return;
+        }
+        const touch = e.touches[0];
+        startDrag(touch.clientX, touch.clientY);
+    };
+    // タッチ移動（2本指目が触れた瞬間も即キャンセル）
+    const handleTrackTouchMove = (e) => {
+        if (!dragStateRef.current.active)
+            return;
+        if (e.touches.length !== 1) {
+            cancelDrag();
+            return;
+        }
+        const touch = e.touches[0];
+        moveDrag(touch.clientX, touch.clientY);
+    };
+    const handleTrackTouchEnd = () => {
+        if (dragStateRef.current.active) {
+            cancelDrag();
+        }
+    };
+    // PCブラウザ検証用マウスイベント（つまみ起点のみ開始）
+    const handleThumbMouseDown = (e) => {
+        e.preventDefault();
+        e.stopPropagation();
+        startDrag(e.clientX, e.clientY);
+    };
+    useEffect(() => {
+        if (!isDragging)
+            return;
+        const handleWindowMouseMove = (e) => {
+            moveDrag(e.clientX, e.clientY);
+        };
+        const handleWindowMouseUp = () => {
+            if (dragStateRef.current.active) {
+                cancelDrag();
+            }
+        };
+        window.addEventListener('mousemove', handleWindowMouseMove);
+        window.addEventListener('mouseup', handleWindowMouseUp);
+        return () => {
+            window.removeEventListener('mousemove', handleWindowMouseMove);
+            window.removeEventListener('mouseup', handleWindowMouseUp);
+        };
+    }, [isDragging, moveDrag, cancelDrag]);
+    const progressRatio = dragStateRef.current.maxSlidePx > 0
+        ? Math.min(1, dragX / (dragStateRef.current.maxSlidePx * UNLOCK_THRESHOLD_RATIO))
+        : 0;
+    return (React.createElement("div", { ref: trackRef, onTouchStart: (e) => {
+            // トラック背景への2本指接触や直接タッチではドラッグ開始させない
+            if (e.touches.length !== 1 && dragStateRef.current.active) {
+                cancelDrag();
+            }
+        }, onTouchMove: handleTrackTouchMove, onTouchEnd: handleTrackTouchEnd, onTouchCancel: handleTrackTouchEnd, style: { touchAction: 'none' }, className: "relative w-full h-14 rounded-full border border-neutral-800 bg-neutral-950 p-1 flex items-center select-none overflow-hidden" },
+        React.createElement("div", { className: "absolute inset-y-0 left-0 bg-emerald-950/60 pointer-events-none transition-none", style: { width: `${Math.round(progressRatio * 100)}%` } }),
+        React.createElement("div", { className: "w-full text-center pointer-events-none z-10 pl-10 pr-4" },
+            React.createElement("span", { className: "text-xs font-semibold tracking-wider text-neutral-400" }, "\u53F3\u3078\u30B9\u30E9\u30A4\u30C9\u3057\u3066\u89E3\u9664 \u2192")),
+        React.createElement("div", { role: "slider", "aria-label": "\u53F3\u3078\u30B9\u30E9\u30A4\u30C9\u3057\u3066\u30ED\u30C3\u30AF\u89E3\u9664", "aria-valuemin": 0, "aria-valuemax": 100, "aria-valuenow": Math.round(progressRatio * 100), onTouchStart: handleThumbTouchStart, onMouseDown: handleThumbMouseDown, style: {
+                width: `${THUMB_SIZE}px`,
+                height: `${THUMB_SIZE}px`,
+                transform: `translateX(${dragX}px)`,
+                touchAction: 'none',
+            }, className: `relative z-20 rounded-full flex items-center justify-center cursor-grab active:cursor-grabbing ${isDragging
+                ? 'bg-emerald-500 text-slate-950 shadow-lg shadow-emerald-500/30'
+                : 'bg-neutral-800 text-neutral-200 border border-neutral-700'} ${isDragging ? '' : 'transition-transform duration-150 ease-out'}` },
+            React.createElement("span", { className: "text-base font-bold pointer-events-none" }, "\uD83D\uDD13"))));
+}
+
+
+// --- HoldToRecordButton.tsx ---
+const HOLD_DURATION_MS = 1000; // 1秒長押しで記録完了
+const MAX_MOVE_DISTANCE_PX = 10; // 押下中の許容移動量（10pxを超えたら即キャンセル）
+const TICK_INTERVAL_MS = 50; // 進捗更新間隔
+function HoldToRecordButton({ icon, label, accent = 'sky', onRecord, }) {
+    const [progress, setProgress] = useState(0);
+    const [isHolding, setIsHolding] = useState(false);
+    const timerRef = useRef(null);
+    const holdStateRef = useRef({
+        active: false,
+        startX: 0,
+        startY: 0,
+        startTime: 0,
+    });
+    const clearHoldTimer = useCallback(() => {
+        if (timerRef.current) {
+            clearInterval(timerRef.current);
+            timerRef.current = null;
+        }
+    }, []);
+    const cancelHold = useCallback(() => {
+        clearHoldTimer();
+        holdStateRef.current.active = false;
+        setIsHolding(false);
+        setProgress(0);
+    }, [clearHoldTimer]);
+    useEffect(() => {
+        return () => {
+            clearHoldTimer();
+        };
+    }, [clearHoldTimer]);
+    const startHold = useCallback((clientX, clientY) => {
+        clearHoldTimer();
+        const now = Date.now();
+        holdStateRef.current = {
+            active: true,
+            startX: clientX,
+            startY: clientY,
+            startTime: now,
+        };
+        setIsHolding(true);
+        setProgress(0);
+        timerRef.current = setInterval(() => {
+            if (!holdStateRef.current.active) {
+                clearHoldTimer();
+                return;
+            }
+            const elapsed = Date.now() - holdStateRef.current.startTime;
+            const nextProgress = Math.min(100, Math.round((elapsed / HOLD_DURATION_MS) * 100));
+            if (elapsed >= HOLD_DURATION_MS) {
+                clearHoldTimer();
+                holdStateRef.current.active = false;
+                setIsHolding(false);
+                setProgress(0);
+                onRecord();
+            }
+            else {
+                setProgress(nextProgress);
+            }
+        }, TICK_INTERVAL_MS);
+    }, [clearHoldTimer, onRecord]);
+    const checkMoveAndCancelIfDrifted = useCallback((clientX, clientY) => {
+        const state = holdStateRef.current;
+        if (!state.active)
+            return;
+        const distance = Math.hypot(clientX - state.startX, clientY - state.startY);
+        if (distance > MAX_MOVE_DISTANCE_PX) {
+            cancelHold();
+        }
+    }, [cancelHold]);
+    // タッチイベント（単一指のみ許可、2点以上の接触は即キャンセル）
+    const handleTouchStart = (e) => {
+        e.stopPropagation();
+        if (e.touches.length !== 1) {
+            cancelHold();
+            return;
+        }
+        const touch = e.touches[0];
+        startHold(touch.clientX, touch.clientY);
+    };
+    const handleTouchMove = (e) => {
+        e.stopPropagation();
+        if (!holdStateRef.current.active)
+            return;
+        if (e.touches.length !== 1) {
+            cancelHold();
+            return;
+        }
+        const touch = e.touches[0];
+        checkMoveAndCancelIfDrifted(touch.clientX, touch.clientY);
+    };
+    const handleTouchEnd = (e) => {
+        e.stopPropagation();
+        if (holdStateRef.current.active) {
+            cancelHold();
+        }
+    };
+    // PCブラウザ検証用マウスイベント
+    const handleMouseDown = (e) => {
+        if (e.button !== 0)
+            return;
+        e.preventDefault();
+        e.stopPropagation();
+        startHold(e.clientX, e.clientY);
+    };
+    useEffect(() => {
+        if (!isHolding)
+            return;
+        const handleWindowMouseMove = (e) => {
+            checkMoveAndCancelIfDrifted(e.clientX, e.clientY);
+        };
+        const handleWindowMouseUp = () => {
+            if (holdStateRef.current.active) {
+                cancelHold();
+            }
+        };
+        window.addEventListener('mousemove', handleWindowMouseMove);
+        window.addEventListener('mouseup', handleWindowMouseUp);
+        return () => {
+            window.removeEventListener('mousemove', handleWindowMouseMove);
+            window.removeEventListener('mouseup', handleWindowMouseUp);
+        };
+    }, [isHolding, checkMoveAndCancelIfDrifted, cancelHold]);
+    const fillBgClass = accent === 'purple' ? 'bg-purple-600/50' : 'bg-sky-600/50';
+    const activeBorderClass = accent === 'purple'
+        ? 'border-purple-500/80 text-purple-200'
+        : 'border-sky-500/80 text-sky-200';
+    return (React.createElement("button", { type: "button", "aria-label": `${label}を1秒長押しで記録`, onContextMenu: (e) => e.preventDefault(), onTouchStart: handleTouchStart, onTouchMove: handleTouchMove, onTouchEnd: handleTouchEnd, onTouchCancel: handleTouchEnd, onMouseDown: handleMouseDown, style: {
+            width: '56px',
+            height: '56px',
+            touchAction: 'none',
+            WebkitTouchCallout: 'none',
+        }, className: `relative rounded-2xl border bg-neutral-950 flex flex-col items-center justify-center select-none overflow-hidden transition-colors ${isHolding
+            ? activeBorderClass
+            : 'border-neutral-800 text-neutral-400'}` },
+        React.createElement("div", { className: `absolute inset-x-0 bottom-0 pointer-events-none transition-none ${fillBgClass}`, style: { height: `${progress}%` } }),
+        React.createElement("span", { className: "relative z-10 text-lg leading-none pointer-events-none" }, icon),
+        React.createElement("span", { className: "relative z-10 text-[9px] font-semibold tracking-tight mt-1 pointer-events-none" }, isHolding ? `${progress}%` : label)));
+}
+
+
 // --- page.tsx ---
-// DualMap is directly available in scope
+import('@/components/DualMap'), {
+    ssr: false,
+    loading: () => (React.createElement("div", { className: "w-full h-full min-h-[260px] bg-slate-900 flex items-center justify-center text-xs text-slate-500 rounded-xl border border-slate-800" }, "\uD83D\uDDFA\uFE0F \u5730\u56F3\u3092\u8AAD\u307F\u8FBC\u307F\u4E2D...")),
+};
+;
 function KunKatsuApp() {
     const [activeTab, setActiveTab] = useState('walk');
     const [profile, setProfile] = useState(null);
     const [mapEngine, setMapEngine] = useState('osm');
     const [darkMode, setDarkMode] = useState(true);
     const [pocketLock, setPocketLock] = useState(false);
-    const [unlockProgress, setUnlockProgress] = useState(0);
     const [isWalking, setIsWalking] = useState(false);
     const [isSimulating, setIsSimulating] = useState(false);
     const [elapsedSec, setElapsedSec] = useState(0);
@@ -565,10 +998,32 @@ function KunKatsuApp() {
     const [allWalks, setAllWalks] = useState([]);
     const [heatmapLayer, setHeatmapLayer] = useState('sniff');
     const [periodFilter, setPeriodFilter] = useState('all');
+    const [toastMessage, setToastMessage] = useState(null);
+    const toastTimeoutRef = useRef(null);
+    const [lockFlashColor, setLockFlashColor] = useState(null);
+    const flashTimeoutRef = useRef(null);
+    const iosHapticLabelRef = useRef(null);
+    const [preparedShareFile, setPreparedShareFile] = useState(null);
+    const [preparedShareBlob, setPreparedShareBlob] = useState(null);
+    const [isGeneratingShareImage, setIsGeneratingShareImage] = useState(false);
+    const [showShareModalUrl, setShowShareModalUrl] = useState(null);
+    const [isWakeLocked, setIsWakeLocked] = useState(false);
+    const [lastGpsReceivedAt, setLastGpsReceivedAt] = useState(null);
+    const [secondsSinceLastGps, setSecondsSinceLastGps] = useState(0);
+    const [totalInterruptedSec, setTotalInterruptedSec] = useState(0);
+    const hiddenStartTimestampRef = useRef(null);
+    const totalInterruptedSecRef = useRef(0);
+    const showToast = (msg) => {
+        if (toastTimeoutRef.current)
+            clearTimeout(toastTimeoutRef.current);
+        setToastMessage(msg);
+        toastTimeoutRef.current = setTimeout(() => {
+            setToastMessage(null);
+        }, 3000);
+    };
     const slowStartTimestampRef = useRef(null);
     const lastPointRef = useRef(null);
     const holdIntervalRef = useRef(null);
-    const unlockIntervalRef = useRef(null);
     const wakeLockRef = useRef(null);
     // 初期化・プロフィール取得・現在地取得
     useEffect(() => {
@@ -599,37 +1054,60 @@ function KunKatsuApp() {
             }
         })();
     }, []);
-    // 散歩タイマー
+    // 散歩タイマー（最終GPS受信秒数の更新連動）
     useEffect(() => {
         if (!isWalking)
             return;
         const timer = setInterval(() => {
             setElapsedSec((prev) => prev + 1);
+            if (lastGpsReceivedAt) {
+                setSecondsSinceLastGps(Math.max(0, Math.floor((Date.now() - lastGpsReceivedAt) / 1000)));
+            }
         }, 1000);
         return () => clearInterval(timer);
-    }, [isWalking]);
-    // Screen Wake Lock API の自動制御（散歩中のスリープ防止）
+    }, [isWalking, lastGpsReceivedAt]);
+    // Screen Wake Lock API の自動制御 ＆ visibilitychange 非表示中断時間の計測
     useEffect(() => {
         if (!isWalking) {
             if (wakeLockRef.current) {
                 wakeLockRef.current.release().catch(() => { });
                 wakeLockRef.current = null;
             }
+            setIsWakeLocked(false);
             return;
         }
         const requestWakeLock = async () => {
             if ('wakeLock' in navigator) {
                 try {
-                    wakeLockRef.current = await navigator.wakeLock.request('screen');
+                    const sentinel = await navigator.wakeLock.request('screen');
+                    wakeLockRef.current = sentinel;
+                    setIsWakeLocked(true);
+                    sentinel.addEventListener('release', () => {
+                        setIsWakeLocked(false);
+                    });
                 }
                 catch (err) {
                     console.warn('Wake Lock request failed:', err);
+                    setIsWakeLocked(false);
                 }
             }
         };
         requestWakeLock();
         const handleVisibilityChange = () => {
-            if (document.visibilityState === 'visible' && isWalking) {
+            if (!isWalking)
+                return;
+            if (document.visibilityState === 'hidden') {
+                hiddenStartTimestampRef.current = Date.now();
+            }
+            else if (document.visibilityState === 'visible') {
+                if (hiddenStartTimestampRef.current) {
+                    const diffSec = Math.round((Date.now() - hiddenStartTimestampRef.current) / 1000);
+                    if (diffSec > 0) {
+                        totalInterruptedSecRef.current += diffSec;
+                        setTotalInterruptedSec(totalInterruptedSecRef.current);
+                    }
+                    hiddenStartTimestampRef.current = null;
+                }
                 requestWakeLock();
             }
         };
@@ -640,6 +1118,7 @@ function KunKatsuApp() {
                 wakeLockRef.current.release().catch(() => { });
                 wakeLockRef.current = null;
             }
+            setIsWakeLocked(false);
         };
     }, [isWalking]);
     // 室内GPSシミュレーター
@@ -665,6 +1144,8 @@ function KunKatsuApp() {
     }, [isWalking, isSimulating, profile]);
     // 座標受信ハンドラ（StrictMode 二重加算バグ防止のため updater 外で副作用を処理）
     const handleNewCoordinate = (lat, lng, timestamp) => {
+        setLastGpsReceivedAt(Date.now());
+        setSecondsSinceLastGps(0);
         // 自宅防犯マスク判定（半径内は座標データそのものを即時破棄し、現在地表示もオフセット中心に固定）
         if (profile &&
             isInsideHomeGeofence(lat, lng, profile.homeLat, profile.homeLng, profile.geofenceRadiusMeters)) {
@@ -726,18 +1207,62 @@ function KunKatsuApp() {
             catch (_) { }
         }
     };
-    const handleManualAction = (type) => {
-        if (!isWalking)
-            return;
+    // D2合意: 記録完了フィードバック（①0.3秒画面発光 ②Android振動＋iOS18スイッチ触覚［実験的］ ③任意設定のWeb Audio効果音）
+    // ※すべてtry/catchで独立保護し、失敗しても記録自体は必ず成功させる
+    const triggerCompletionFeedback = (type) => {
+        // ① 0.3秒（300ms）画面発光
+        try {
+            if (flashTimeoutRef.current)
+                clearTimeout(flashTimeoutRef.current);
+            const color = type === 'pee' ? 'sky' : type === 'poop' ? 'purple' : 'amber';
+            setLockFlashColor(color);
+            flashTimeoutRef.current = setTimeout(() => {
+                setLockFlashColor(null);
+            }, 300);
+        }
+        catch (_) { }
+        // ② Android Vibration API
         if (type === 'sniff_manual')
             triggerVibration([40, 60, 40]);
         if (type === 'pee')
             triggerVibration(50);
         if (type === 'poop')
             triggerVibration(180);
+        // ②' iOS 18+ Safari 実験的スイッチ触覚フィードバック（非公式挙動のため失敗時は無視）
+        try {
+            iosHapticLabelRef.current?.click();
+        }
+        catch (_) { }
+        // ③ 任意設定の効果音（Web Audio API）
+        if (profile?.soundFeedbackEnabled) {
+            try {
+                const AudioCtx = window.AudioContext || window.webkitAudioContext;
+                if (AudioCtx) {
+                    const ctx = new AudioCtx();
+                    const osc = ctx.createOscillator();
+                    const gain = ctx.createGain();
+                    osc.type = 'sine';
+                    osc.frequency.value = type === 'pee' ? 880 : type === 'poop' ? 520 : 660;
+                    gain.gain.setValueAtTime(0.08, ctx.currentTime);
+                    gain.gain.exponentialRampToValueAtTime(0.001, ctx.currentTime + 0.12);
+                    osc.connect(gain);
+                    gain.connect(ctx.destination);
+                    osc.start();
+                    osc.stop(ctx.currentTime + 0.12);
+                    setTimeout(() => {
+                        ctx.close().catch(() => { });
+                    }, 200);
+                }
+            }
+            catch (_) { }
+        }
+    };
+    const handleManualAction = (type) => {
+        if (!isWalking)
+            return;
         if (profile &&
             isInsideHomeGeofence(currentLat, currentLng, profile.homeLat, profile.homeLng, profile.geofenceRadiusMeters)) {
-            alert('自宅マスク範囲内のため、座標ピン留めはスキップされました（防犯保護）');
+            showToast('🛡️ 自宅マスク範囲内（防犯保護のため記録スキップ）');
             return;
         }
         const logId = `manual_${Date.now()}`;
@@ -757,7 +1282,9 @@ function KunKatsuApp() {
         }
         setActionLogs((prev) => [...prev, newLog]);
         setUndoTargetId(logId);
-        if (type === 'poop') {
+        // 記録確定後にフィードバックを発火（失敗しても記録に影響しない）
+        triggerCompletionFeedback(type);
+        if (type === 'poop' && !pocketLock) {
             setShowPoopSelectorForId(logId);
         }
         setTimeout(() => {
@@ -791,6 +1318,11 @@ function KunKatsuApp() {
         setGeofenceMaskedCount(0);
         lastPointRef.current = null;
         slowStartTimestampRef.current = null;
+        hiddenStartTimestampRef.current = null;
+        totalInterruptedSecRef.current = 0;
+        setTotalInterruptedSec(0);
+        setLastGpsReceivedAt(null);
+        setSecondsSinceLastGps(0);
         setIsSimulating(withSimulator);
         setIsWalking(true);
     };
@@ -813,6 +1345,7 @@ function KunKatsuApp() {
             routePoints,
             actionLogs,
             memo: '',
+            backgroundInterruptedSec: totalInterruptedSecRef.current,
         };
         await saveWalkSession(completedWalk);
         setLatestWalk(completedWalk);
@@ -844,30 +1377,6 @@ function KunKatsuApp() {
         }
         setStopHoldProgress(0);
     };
-    // ポケットロック解除長押しハンドラ
-    const handleUnlockHoldStart = () => {
-        if (unlockIntervalRef.current)
-            clearInterval(unlockIntervalRef.current);
-        let progress = 0;
-        unlockIntervalRef.current = setInterval(() => {
-            progress += 10;
-            if (progress >= 100) {
-                clearInterval(unlockIntervalRef.current);
-                setUnlockProgress(0);
-                setPocketLock(false);
-            }
-            else {
-                setUnlockProgress(progress);
-            }
-        }, 100);
-    };
-    const handleUnlockHoldEnd = () => {
-        if (unlockIntervalRef.current) {
-            clearInterval(unlockIntervalRef.current);
-            unlockIntervalRef.current = null;
-        }
-        setUnlockProgress(0);
-    };
     const formatTime = (totalSec) => {
         const mins = Math.floor(totalSec / 60);
         const secs = totalSec % 60;
@@ -882,6 +1391,32 @@ function KunKatsuApp() {
         const cutoff = now - periodDays * 24 * 60 * 60 * 1000;
         return allWalks.filter((w) => w.startTime >= cutoff);
     }, [allWalks, periodFilter]);
+    // サマリー画面表示時のシェア画像事前生成（Web Share API の即時タップ発火用）
+    useEffect(() => {
+        if (activeTab === 'summary' && latestWalk) {
+            let isMounted = true;
+            setIsGeneratingShareImage(true);
+            generateShareCardBlob(latestWalk, profile?.name || '愛犬')
+                .then((blob) => {
+                if (!isMounted)
+                    return;
+                const dateStr = new Date(latestWalk.startTime).toISOString().slice(0, 10).replace(/-/g, '');
+                const filename = `kunkatsu_${dateStr}_${latestWalk.id.slice(-6)}.png`;
+                const file = new File([blob], filename, { type: 'image/png' });
+                setPreparedShareBlob(blob);
+                setPreparedShareFile(file);
+                setIsGeneratingShareImage(false);
+            })
+                .catch((err) => {
+                console.warn('Failed to pre-generate share card:', err);
+                if (isMounted)
+                    setIsGeneratingShareImage(false);
+            });
+            return () => {
+                isMounted = false;
+            };
+        }
+    }, [activeTab, latestWalk, profile?.name]);
     // 実測クン活スポットTop3の自動クラスタリング集計
     const topSniffSpots = useMemo(() => {
         const sniffs = filteredWalks.flatMap((w) => w.actionLogs.filter((l) => l.type === 'sniff_auto' || l.type === 'sniff_manual'));
@@ -926,132 +1461,123 @@ function KunKatsuApp() {
             lng: profile?.homeLng ?? currentLng,
         };
     }, [filteredWalks, profile, currentLat, currentLng]);
-    // 防犯保護済みシェア画像（リザルトカード）のCanvas生成・ダウンロード
-    const handleDownloadShareCard = (walk) => {
-        const canvas = document.createElement('canvas');
-        canvas.width = 800;
-        canvas.height = 1000;
-        const ctx = canvas.getContext('2d');
-        if (!ctx)
+    // リザルト画像の保存・共有ハンドラ（Web Share API 即時発火 ＆ フォールバック）
+    const handleShareOrSave = async (walk) => {
+        let file = preparedShareFile;
+        let blob = preparedShareBlob;
+        // 事前生成が未完了の場合はその場で生成
+        if (!file || !blob) {
+            setIsGeneratingShareImage(true);
+            try {
+                blob = await generateShareCardBlob(walk, profile?.name || '愛犬');
+                const dateStr = new Date(walk.startTime).toISOString().slice(0, 10).replace(/-/g, '');
+                const filename = `kunkatsu_${dateStr}_${walk.id.slice(-6)}.png`;
+                file = new File([blob], filename, { type: 'image/png' });
+                setPreparedShareBlob(blob);
+                setPreparedShareFile(file);
+            }
+            catch (e) {
+                showToast('画像の生成に失敗しました');
+                setIsGeneratingShareImage(false);
+                return;
+            }
+            setIsGeneratingShareImage(false);
+        }
+        const filename = file.name;
+        // 1. Web Share API (iOS Safari / Android): 事前生成Fileがあるためタップ直後に即発火
+        if (typeof navigator !== 'undefined' &&
+            'canShare' in navigator &&
+            typeof navigator.canShare === 'function' &&
+            navigator.canShare({ files: [file] })) {
+            try {
+                await navigator.share({
+                    files: [file],
+                });
+                showToast('✅ 共有シートを起動しました');
+                return;
+            }
+            catch (err) {
+                // タスク 3.4: ユーザーが共有シートをキャンセルして閉じた場合はエラー扱いしない
+                if (err?.name === 'AbortError') {
+                    return;
+                }
+                console.warn('Web Share failed, fallback to download:', err);
+            }
+        }
+        // 2. PCブラウザ等: Blob URL 直接ダウンロード（DataURLより軽量・安全）
+        try {
+            const url = URL.createObjectURL(blob);
+            const link = document.createElement('a');
+            link.download = filename;
+            link.href = url;
+            link.click();
+            setTimeout(() => URL.revokeObjectURL(url), 1000);
+            showToast('📥 リザルト画像を保存しました');
             return;
-        // 背景グラデーション
-        const grad = ctx.createLinearGradient(0, 0, 0, 1000);
-        grad.addColorStop(0, '#0f172a');
-        grad.addColorStop(1, '#020617');
-        ctx.fillStyle = grad;
-        ctx.fillRect(0, 0, 800, 1000);
-        // ヘッダー
-        ctx.fillStyle = '#10b981';
-        ctx.font = 'bold 34px sans-serif';
-        ctx.fillText(`🐕 ${profile?.name || '愛犬'}のお散歩＆クン活ログ`, 48, 72);
-        ctx.fillStyle = '#94a3b8';
-        ctx.font = '20px sans-serif';
-        const dateStr = new Date(walk.startTime).toLocaleDateString('ja-JP');
-        ctx.fillText(`${dateStr}  |  🛡️ 自宅周辺マスク保護済（座標・住所非表示）`, 48, 110);
-        // ルート抽象描画ボックス（地図背景を描画せず軌跡形状とクン活ピンのみ描画して自宅特定を完全防止）
-        ctx.fillStyle = '#1e293b';
-        ctx.fillRect(48, 140, 704, 460);
-        ctx.strokeStyle = '#334155';
-        ctx.lineWidth = 2;
-        ctx.strokeRect(48, 140, 704, 460);
-        const pts = walk.routePoints;
-        if (pts.length >= 2) {
-            const lats = pts.map((p) => p.lat);
-            const lngs = pts.map((p) => p.lng);
-            const minLat = Math.min(...lats);
-            const maxLat = Math.max(...lats);
-            const minLng = Math.min(...lngs);
-            const maxLng = Math.max(...lngs);
-            const latSpan = Math.max(maxLat - minLat, 0.0005);
-            const lngSpan = Math.max(maxLng - minLng, 0.0005);
-            const toX = (lng) => 108 + ((lng - minLng) / lngSpan) * 584;
-            const toY = (lat) => 540 - ((lat - minLat) / latSpan) * 340;
-            ctx.strokeStyle = '#10b981';
-            ctx.lineWidth = 6;
-            ctx.lineCap = 'round';
-            ctx.lineJoin = 'round';
-            ctx.beginPath();
-            pts.forEach((p, idx) => {
-                const x = toX(p.lng);
-                const y = toY(p.lat);
-                if (idx === 0)
-                    ctx.moveTo(x, y);
-                else
-                    ctx.lineTo(x, y);
-            });
-            ctx.stroke();
-            // クン活・排泄ピン描画
-            walk.actionLogs.forEach((log) => {
-                const x = toX(log.lng);
-                const y = toY(log.lat);
-                ctx.beginPath();
-                ctx.arc(x, y, log.weight >= 3 ? 10 : 7, 0, Math.PI * 2);
-                ctx.fillStyle =
-                    log.type === 'sniff_manual' || log.type === 'sniff_auto'
-                        ? '#f59e0b'
-                        : log.type === 'pee'
-                            ? '#38bdf8'
-                            : '#a855f7';
-                ctx.fill();
-            });
         }
-        else {
-            ctx.fillStyle = '#64748b';
-            ctx.font = '22px sans-serif';
-            ctx.fillText('ルート軌跡（防犯マスク外）', 260, 370);
+        catch (e) {
+            console.warn('Direct download failed, showing modal preview:', e);
         }
-        // 4指標パネル
-        const stats = [
-            { label: '移動距離', val: `${walk.distanceMeters} m`, color: '#22d3ee' },
-            { label: 'お散歩時間', val: formatTime(walk.durationSec), color: '#34d399' },
-            { label: 'クン活合計時間', val: formatTime(walk.sniffDurationSec), color: '#fbbf24' },
-            { label: '飼い主消費カロリー', val: `${walk.ownerCaloriesKcal} kcal`, color: '#fb7185' },
-        ];
-        stats.forEach((st, idx) => {
-            const col = idx % 2;
-            const row = Math.floor(idx / 2);
-            const bx = 48 + col * 360;
-            const by = 630 + row * 145;
-            ctx.fillStyle = '#1e293b';
-            ctx.fillRect(bx, by, 344, 125);
-            ctx.fillStyle = '#94a3b8';
-            ctx.font = '20px sans-serif';
-            ctx.fillText(st.label, bx + 24, by + 42);
-            ctx.fillStyle = st.color;
-            ctx.font = 'bold 38px monospace';
-            ctx.fillText(st.val, bx + 24, by + 95);
-        });
-        // PNGとしてダウンロード（Exifなし）
-        const link = document.createElement('a');
-        link.download = `kunkatsu_share_${walk.id}.png`;
-        link.href = canvas.toDataURL('image/png');
-        link.click();
+        // 3. フォールバック: 長押し保存モーダルを表示
+        const previewUrl = URL.createObjectURL(blob);
+        setShowShareModalUrl(previewUrl);
     };
     return (React.createElement("main", { className: `min-h-screen ${darkMode ? 'bg-slate-950 text-slate-100' : 'bg-slate-50 text-slate-900'} pb-20 select-none` },
-        pocketLock && (React.createElement("div", { className: "fixed inset-0 z-50 bg-black flex flex-col items-center justify-between p-8 text-neutral-400 select-none" },
-            React.createElement("div", { className: "text-center pt-8" },
-                React.createElement("span", { className: "text-3xl" }, "\uD83D\uDD12"),
-                React.createElement("h2", { className: "text-sm font-semibold tracking-widest mt-2 text-neutral-300" }, "POCKET LOCK"),
-                React.createElement("p", { className: "text-[11px] text-neutral-600 mt-1" }, "\u5E38\u6642\u70B9\u706F\u30FB\u6709\u6A5FEL\u7701\u96FB\u529B\u4E2D\uFF08\u8AA4\u30BF\u30C3\u30D7\u9632\u6B62\uFF09")),
-            React.createElement("div", { className: "grid grid-cols-3 gap-4 text-center my-auto w-full max-w-xs" },
-                React.createElement("div", null,
-                    React.createElement("span", { className: "text-[10px] text-neutral-600 uppercase" }, "\u6642\u9593"),
-                    React.createElement("p", { className: "text-lg font-mono font-bold text-neutral-400" }, formatTime(elapsedSec))),
-                React.createElement("div", null,
-                    React.createElement("span", { className: "text-[10px] text-neutral-600 uppercase" }, "\u8DDD\u96E2"),
-                    React.createElement("p", { className: "text-lg font-mono font-bold text-neutral-400" },
-                        distanceMeters,
-                        "m")),
-                React.createElement("div", null,
-                    React.createElement("span", { className: "text-[10px] text-neutral-600 uppercase" }, "\u30AF\u30F3\u6D3B"),
-                    React.createElement("p", { className: "text-lg font-mono font-bold text-neutral-400" }, formatTime(sniffTotalSec)))),
-            React.createElement("div", { className: "w-full max-w-xs pb-12" },
-                React.createElement("div", { className: "relative overflow-hidden rounded-2xl border border-neutral-800 bg-neutral-900" },
-                    React.createElement("div", { className: "absolute inset-0 bg-emerald-700 transition-all duration-75 pointer-events-none", style: { width: `${unlockProgress}%` } }),
-                    React.createElement("button", { onMouseDown: handleUnlockHoldStart, onMouseUp: handleUnlockHoldEnd, onTouchStart: handleUnlockHoldStart, onTouchEnd: handleUnlockHoldEnd, className: "relative w-full py-4 text-xs font-bold uppercase tracking-wider text-neutral-200 text-center" },
-                        "\u9577\u62BC\u3057\u3067\u30ED\u30C3\u30AF\u89E3\u9664 (",
-                        unlockProgress,
-                        "%)"))))),
+        React.createElement("label", { ref: iosHapticLabelRef, "aria-hidden": "true", className: "fixed -top-96 -left-96 w-px h-px opacity-0 pointer-events-none overflow-hidden" },
+            React.createElement("input", { type: "checkbox", ...{ switch: '' }, tabIndex: -1 })),
+        pocketLock && (React.createElement("div", { style: { touchAction: 'none' }, className: `fixed inset-0 z-50 flex flex-col items-center justify-between p-4 text-neutral-400 select-none touch-none transition-colors duration-150 ${lockFlashColor === 'sky'
+                ? 'bg-sky-900/75'
+                : lockFlashColor === 'purple'
+                    ? 'bg-purple-900/75'
+                    : lockFlashColor === 'amber'
+                        ? 'bg-amber-900/75'
+                        : 'bg-black'}` },
+            React.createElement("div", { className: "w-full max-w-xs pt-2 flex flex-col gap-3" },
+                React.createElement("div", { className: "flex items-center justify-between" },
+                    React.createElement(HoldToRecordButton, { icon: "\uD83D\uDCA7", label: "\u30AA\u30B7\u30C3\u30B3", accent: "sky", onRecord: () => handleManualAction('pee') }),
+                    React.createElement("div", { className: "text-center px-1" },
+                        React.createElement("div", { className: "flex items-center justify-center gap-1.5 text-neutral-400" },
+                            React.createElement("span", { className: "text-lg" }, "\uD83D\uDD12"),
+                            React.createElement("h2", { className: "text-xs font-bold tracking-widest text-neutral-300 uppercase" }, "Pocket Lock"),
+                            React.createElement("span", { className: `text-[9px] px-1.5 py-0.5 rounded-full font-mono flex items-center gap-0.5 ${isWakeLocked
+                                    ? 'bg-emerald-950/80 text-emerald-400 border border-emerald-800/60'
+                                    : 'bg-rose-950/80 text-rose-400 border border-rose-800/60'}`, title: isWakeLocked ? 'Wake Lock維持中（常時点灯）' : 'Wake Lock未取得' },
+                                React.createElement("span", null, isWakeLocked ? '🟢' : '🔴'),
+                                React.createElement("span", null, isWakeLocked ? 'WL点灯' : 'WL消灯'))),
+                        React.createElement("p", { className: "text-[9px] text-neutral-600 mt-0.5" }, "\u5E38\u6642\u70B9\u706F\u30FB\u8AA4\u30BF\u30C3\u30D7\u9632\u6B62\u4E2D")),
+                    React.createElement(HoldToRecordButton, { icon: "\uD83D\uDCA9", label: "\u30A6\u30F3\u30C1", accent: "purple", onRecord: () => handleManualAction('poop') })),
+                React.createElement("div", { className: "w-full px-2" },
+                    React.createElement(SlideToUnlock, { onUnlock: () => setPocketLock(false) })),
+                undoTargetId && (React.createElement("div", { className: "w-full px-3 py-2 bg-neutral-900 border border-neutral-800 rounded-xl flex items-center justify-between animate-fade-in" },
+                    React.createElement("span", { className: "text-xs text-neutral-300 flex items-center gap-1" },
+                        React.createElement("span", null, "\u2705"),
+                        " \u8A18\u9332\u5B8C\u4E86"),
+                    React.createElement("button", { type: "button", onClick: handleUndoLastAction, className: "text-xs bg-neutral-800 hover:bg-neutral-700 active:scale-95 px-3 py-1 rounded text-amber-400 font-bold border border-neutral-700" }, "\u5143\u306B\u623B\u3059 (3s)"))),
+                toastMessage && (React.createElement("div", { className: "w-full px-3 py-2 bg-neutral-900/90 border border-amber-600/50 rounded-xl text-center text-xs text-amber-300 animate-fade-in" }, toastMessage))),
+            React.createElement("div", { className: "my-auto w-full max-w-xs flex flex-col items-center gap-2" },
+                React.createElement("div", { className: "grid grid-cols-3 gap-4 text-center w-full" },
+                    React.createElement("div", null,
+                        React.createElement("span", { className: "text-[10px] text-neutral-600 uppercase" }, "\u6642\u9593"),
+                        React.createElement("p", { className: "text-lg font-mono font-bold text-neutral-300" }, formatTime(elapsedSec))),
+                    React.createElement("div", null,
+                        React.createElement("span", { className: "text-[10px] text-neutral-600 uppercase" }, "\u8DDD\u96E2"),
+                        React.createElement("p", { className: "text-lg font-mono font-bold text-neutral-300" },
+                            distanceMeters,
+                            "m")),
+                    React.createElement("div", null,
+                        React.createElement("span", { className: "text-[10px] text-neutral-600 uppercase" }, "\u30AF\u30F3\u6D3B"),
+                        React.createElement("p", { className: "text-lg font-mono font-bold text-neutral-300" }, formatTime(sniffTotalSec)))),
+                React.createElement("div", { className: "mt-1" },
+                    React.createElement("span", { className: `text-[10px] font-mono px-2 py-0.5 rounded transition-colors ${secondsSinceLastGps >= 15
+                            ? 'bg-rose-950/80 text-rose-300 border border-rose-800'
+                            : secondsSinceLastGps >= 6
+                                ? 'bg-amber-950/80 text-amber-300 border border-amber-800'
+                                : 'text-neutral-500 bg-neutral-900/60 border border-neutral-800/50'}` },
+                        "\uD83D\uDCE1 GPS: ",
+                        lastGpsReceivedAt ? `受信 ${secondsSinceLastGps}秒前` : '受信待機中',
+                        totalInterruptedSec > 0 && `（中断計 ${totalInterruptedSec}s）`))),
+            React.createElement("div", { className: "w-full max-w-xs pb-6 text-center" },
+                React.createElement("p", { className: "text-[10px] text-neutral-700" }, "\u89D2\u306E\u30A2\u30A4\u30B3\u30F3\u9577\u62BC\u3057\u3067\u8A18\u9332 / \u4E0A\u90E8\u30D0\u30FC\u53F3\u30B9\u30E9\u30A4\u30C9\u3067\u89E3\u9664")))),
         React.createElement("header", { className: "px-4 py-3 border-b border-slate-800/40 flex justify-between items-center backdrop-blur bg-slate-900/60 sticky top-0 z-30" },
             React.createElement("div", { className: "flex items-center gap-2" },
                 React.createElement("span", { className: "text-xl" }, "\uD83D\uDC15"),
@@ -1084,6 +1610,7 @@ function KunKatsuApp() {
             !isWalking ? (React.createElement("div", { className: "flex flex-col gap-2 mt-2" },
                 React.createElement("button", { onClick: () => startWalk(false), className: "w-full py-4 bg-emerald-600 hover:bg-emerald-500 active:scale-95 transition rounded-2xl font-bold text-lg shadow-lg shadow-emerald-900/40 text-white" }, "\uD83D\uDC3E \u304A\u6563\u6B69\u30B9\u30BF\u30FC\u30C8"),
                 React.createElement("button", { onClick: () => startWalk(true), className: "w-full py-2 bg-slate-800 hover:bg-slate-700 active:scale-95 transition rounded-xl text-xs text-slate-300" }, "\uD83E\uDDEA \u5BA4\u5185\u7528GPS\u30B7\u30DF\u30E5\u30EC\u30FC\u30BF\u30FC\u3067\u958B\u59CB"))) : (React.createElement("div", { className: "flex flex-col gap-2.5 mt-1" },
+                toastMessage && (React.createElement("div", { className: "p-2.5 bg-amber-950/80 border border-amber-500/40 rounded-xl text-center text-xs text-amber-300 animate-fade-in" }, toastMessage)),
                 undoTargetId && (React.createElement("div", { className: "flex items-center justify-between p-2.5 bg-slate-800 border border-slate-700 rounded-xl" },
                     React.createElement("span", { className: "text-xs text-slate-300" }, "\u884C\u52D5\u3092\u8A18\u9332\u3057\u307E\u3057\u305F"),
                     React.createElement("button", { onClick: handleUndoLastAction, className: "text-xs bg-slate-700 hover:bg-slate-600 px-3 py-1 rounded text-amber-400 font-semibold" }, "\u5143\u306B\u623B\u3059 (3s)"))),
@@ -1133,6 +1660,14 @@ function KunKatsuApp() {
                         React.createElement("p", { className: "text-sm font-bold text-rose-400" },
                             latestWalk.ownerCaloriesKcal,
                             " kcal"))),
+                latestWalk.backgroundInterruptedSec && latestWalk.backgroundInterruptedSec > 0 ? (React.createElement("div", { className: "p-2.5 bg-amber-950/40 border border-amber-500/30 rounded-xl flex items-center justify-between text-xs text-amber-300" },
+                    React.createElement("span", { className: "flex items-center gap-1.5" },
+                        React.createElement("span", null, "\u26A0\uFE0F"),
+                        React.createElement("span", null, "\u753B\u9762\u6D88\u706F\u30FB\u4ED6\u30A2\u30D7\u30EA\u5207\u66FF\u306B\u3088\u308B\u4F11\u6B62")),
+                    React.createElement("span", { className: "font-mono font-bold" },
+                        "\u8A18\u9332\u9014\u5207\u308C: \u8A08 ",
+                        latestWalk.backgroundInterruptedSec,
+                        " \u79D2"))) : null,
                 React.createElement("div", { className: "flex flex-col gap-1 mt-1" },
                     React.createElement("label", { className: "text-xs text-slate-400" }, "\u304A\u6563\u6B69\u5199\u771F\u3092\u8FFD\u52A0\uFF08Exif\u81EA\u52D5\u524A\u9664\uFF09"),
                     React.createElement("input", { type: "file", accept: "image/*", onChange: async (e) => {
@@ -1145,7 +1680,9 @@ function KunKatsuApp() {
                             }
                         }, className: "text-xs text-slate-400 file:mr-2 file:py-1 file:px-3 file:rounded file:border-0 file:text-xs file:bg-slate-800 file:text-slate-200" }),
                     latestWalk.safePhotoDataUrl && (React.createElement("img", { src: latestWalk.safePhotoDataUrl, alt: "Sanitized Dog Photo", className: "w-full h-40 object-cover rounded-xl mt-2 border border-slate-700" }))),
-                React.createElement("button", { onClick: () => handleDownloadShareCard(latestWalk), className: "w-full py-2.5 bg-emerald-600 hover:bg-emerald-500 active:scale-95 transition rounded-xl font-bold text-xs text-white mt-1" }, "\uD83D\uDCF8 \u30B7\u30A7\u30A2\u7528\u30EA\u30B6\u30EB\u30C8\u753B\u50CF\u3092\u4FDD\u5B58\uFF08\u81EA\u5B85\u5468\u8FBA\u30FB\u5730\u56F3\u80CC\u666F\u9664\u5916\u6E08\uFF09"))) : (React.createElement("p", { className: "text-xs text-slate-500 text-center py-10" }, "\u307E\u3060\u6563\u6B69\u8A18\u9332\u304C\u3042\u308A\u307E\u305B\u3093\u3002")))),
+                React.createElement("button", { onClick: () => handleShareOrSave(latestWalk), disabled: isGeneratingShareImage, className: "w-full py-3 bg-emerald-600 hover:bg-emerald-500 active:scale-95 transition rounded-xl font-bold text-xs text-white mt-1 flex items-center justify-center gap-2 shadow-lg shadow-emerald-950/40 disabled:opacity-60" }, isGeneratingShareImage ? (React.createElement("span", null, "\u23F3 \u753B\u50CF\u3092\u6E96\u5099\u4E2D...")) : (React.createElement(React.Fragment, null,
+                    React.createElement("span", null, "\uD83D\uDCF8"),
+                    React.createElement("span", null, "\u30EA\u30B6\u30EB\u30C8\u753B\u50CF\u3092\u4FDD\u5B58\u30FB\u5171\u6709\uFF08Web Share / \u9632\u72AF\u4FDD\u8B77\u6E08\uFF09")))))) : (React.createElement("p", { className: "text-xs text-slate-500 text-center py-10" }, "\u307E\u3060\u6563\u6B69\u8A18\u9332\u304C\u3042\u308A\u307E\u305B\u3093\u3002")))),
         activeTab === 'heatmap' && (React.createElement("section", { className: "p-4 flex flex-col gap-3" },
             React.createElement("h2", { className: "text-base font-bold flex items-center gap-2" },
                 React.createElement("span", null, "\uD83D\uDDFA\uFE0F"),
@@ -1203,6 +1740,11 @@ function KunKatsuApp() {
                     React.createElement("button", { onClick: () => setMapEngine('osm'), className: `flex-1 py-2 rounded-lg ${mapEngine === 'osm' ? 'bg-emerald-600 font-bold text-white' : 'bg-slate-800 text-slate-400'}` }, "OpenStreetMap (\u7121\u6599)"),
                     React.createElement("button", { onClick: () => setMapEngine('mapbox'), className: `flex-1 py-2 rounded-lg ${mapEngine === 'mapbox' ? 'bg-cyan-600 font-bold text-white' : 'bg-slate-800 text-slate-400'}` }, "Mapbox GL JS")),
                 React.createElement("input", { type: "text", placeholder: "Mapbox Public Token (pk....)", value: profile.mapboxPublicToken, onChange: (e) => setProfile({ ...profile, mapboxPublicToken: e.target.value }), className: "w-full px-2.5 py-1.5 bg-slate-800 rounded border border-slate-700 text-white text-[11px]" })),
+            React.createElement("div", { className: "p-3 bg-slate-900 rounded-xl border border-slate-800 flex items-center justify-between gap-2" },
+                React.createElement("div", null,
+                    React.createElement("h3", { className: "font-semibold text-slate-200" }, "\uD83D\uDD0A \u8A18\u9332\u5B8C\u4E86\u6642\u306E\u52B9\u679C\u97F3\uFF08iPhone\u5411\u3051\u88DC\u52A9\uFF09"),
+                    React.createElement("p", { className: "text-slate-400 text-[11px] mt-0.5" }, "\u30ED\u30C3\u30AF\u4E2D\u306E\u6392\u6CC4\u8A18\u9332\u6642\u3001\u753B\u9762\u767A\u5149\uFF080.3\u79D2\uFF09\u306B\u52A0\u3048\u3066\u77ED\u3044\u78BA\u8A8D\u97F3\u3092\u9CF4\u3089\u3057\u307E\u3059")),
+                React.createElement("input", { type: "checkbox", checked: Boolean(profile.soundFeedbackEnabled), onChange: (e) => setProfile({ ...profile, soundFeedbackEnabled: e.target.checked }), className: "w-5 h-5 accent-emerald-500 rounded cursor-pointer" })),
             React.createElement("div", { className: "p-3 bg-slate-900 rounded-xl border border-slate-800 flex flex-col gap-2" },
                 React.createElement("h3", { className: "font-semibold text-slate-200" }, "\uD83E\uDDEA \u30C7\u30E2\u7528\u30E2\u30C3\u30AF\u30C7\u30FC\u30BF\u751F\u6210"),
                 React.createElement("button", { onClick: async () => {
@@ -1215,6 +1757,17 @@ function KunKatsuApp() {
                     await saveDogProfile(profile);
                     alert('設定を端末内ローカルに保存しました');
                 }, className: "w-full py-3 bg-emerald-600 text-white font-bold rounded-xl mt-2" }, "\u8A2D\u5B9A\u3092\u4FDD\u5B58"))),
+        showShareModalUrl && (React.createElement("div", { className: "fixed inset-0 z-50 bg-black/85 flex flex-col items-center justify-center p-4 select-none" },
+            React.createElement("div", { className: "bg-slate-900 border border-slate-700 rounded-2xl p-4 max-w-sm w-full flex flex-col items-center gap-3" },
+                React.createElement("h3", { className: "text-sm font-bold text-white flex items-center gap-1.5" },
+                    React.createElement("span", null, "\uD83D\uDCF8"),
+                    " \u753B\u50CF\u3092\u9577\u62BC\u3057\u3057\u3066\u4FDD\u5B58"),
+                React.createElement("p", { className: "text-[11px] text-slate-300 text-center" }, "\u4E0B\u306E\u753B\u50CF\u3092\u9577\u62BC\u3057\u3057\u3001\u300C\u5199\u771F\u306B\u8FFD\u52A0\u300D\u307E\u305F\u306F\u300C\u753B\u50CF\u3092\u4FDD\u5B58\u300D\u3092\u9078\u629E\u3057\u3066\u304F\u3060\u3055\u3044\u3002"),
+                React.createElement("img", { src: showShareModalUrl, alt: "Kunkatsu Share Result", className: "w-full max-h-[60vh] object-contain rounded-xl border border-slate-800" }),
+                React.createElement("button", { onClick: () => {
+                        URL.revokeObjectURL(showShareModalUrl);
+                        setShowShareModalUrl(null);
+                    }, className: "w-full py-2.5 bg-slate-800 hover:bg-slate-700 rounded-xl text-xs font-semibold text-slate-200 mt-1" }, "\u9589\u3058\u308B")))),
         React.createElement("nav", { className: "fixed bottom-0 inset-x-0 bg-slate-900/95 border-t border-slate-800 backdrop-blur flex justify-around items-center py-2 z-40" },
             React.createElement("button", { onClick: () => setActiveTab('walk'), className: `flex flex-col items-center gap-0.5 text-xs ${activeTab === 'walk' ? 'text-emerald-400 font-bold' : 'text-slate-400'}` },
                 React.createElement("span", null, "\uD83D\uDC3E"),
@@ -1229,10 +1782,12 @@ function KunKatsuApp() {
                 React.createElement("span", null, "\u2699\uFE0F"),
                 React.createElement("span", null, "\u8A2D\u5B9A")))));
 }
+
+
 // --- Mount App ---
 const rootElement = document.getElementById("root");
 if (rootElement) {
-    ReactDOM.createRoot(rootElement).render(React.createElement(KunKatsuApp));
+  ReactDOM.createRoot(rootElement).render(React.createElement(KunKatsuApp));
 }
 
   </script>
