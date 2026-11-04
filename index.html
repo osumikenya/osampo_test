@@ -814,14 +814,14 @@ function SlideToUnlock({ onUnlock }) {
             }
         }, onTouchMove: handleTrackTouchMove, onTouchEnd: handleTrackTouchEnd, onTouchCancel: handleTrackTouchEnd, style: { touchAction: 'none' }, className: "relative w-full h-14 rounded-full border border-neutral-800 bg-neutral-950 p-1 flex items-center select-none overflow-hidden" },
         React.createElement("div", { className: "absolute inset-y-0 left-0 bg-emerald-950/60 pointer-events-none transition-none", style: { width: `${Math.round(progressRatio * 100)}%` } }),
-        React.createElement("div", { className: "w-full text-center pointer-events-none z-10 pl-10 pr-4" },
+        React.createElement("div", { className: "absolute inset-0 flex items-center justify-center pointer-events-none z-10 pl-14 pr-4" },
             React.createElement("span", { className: "text-xs font-semibold tracking-wider text-neutral-400" }, "\u53F3\u3078\u30B9\u30E9\u30A4\u30C9\u3057\u3066\u89E3\u9664 \u2192")),
         React.createElement("div", { role: "slider", "aria-label": "\u53F3\u3078\u30B9\u30E9\u30A4\u30C9\u3057\u3066\u30ED\u30C3\u30AF\u89E3\u9664", "aria-valuemin": 0, "aria-valuemax": 100, "aria-valuenow": Math.round(progressRatio * 100), onTouchStart: handleThumbTouchStart, onMouseDown: handleThumbMouseDown, style: {
                 width: `${THUMB_SIZE}px`,
                 height: `${THUMB_SIZE}px`,
                 transform: `translateX(${dragX}px)`,
                 touchAction: 'none',
-            }, className: `relative z-20 rounded-full flex items-center justify-center cursor-grab active:cursor-grabbing ${isDragging
+            }, className: `absolute left-1 top-1/2 -mt-6 shrink-0 z-20 rounded-full flex items-center justify-center cursor-grab active:cursor-grabbing ${isDragging
                 ? 'bg-emerald-500 text-slate-950 shadow-lg shadow-emerald-500/30'
                 : 'bg-neutral-800 text-neutral-200 border border-neutral-700'} ${isDragging ? '' : 'transition-transform duration-150 ease-out'}` },
             React.createElement("span", { className: "text-base font-bold pointer-events-none" }, "\uD83D\uDD13"))));
