@@ -1,0 +1,31 @@
+{
+  "name": "クン活ログ — 愛犬おさんぽトラッカー",
+  "short_name": "クン活ログ",
+  "description": "愛犬のクン活・排泄・散歩ルートを記録するトラッキングWebアプリ",
+  "start_url": "./",
+  "display": "standalone",
+  "background_color": "#FFF7EC",
+  "theme_color": "#FFF7EC",
+  "icons": [
+    {
+      "src": "favicon-32x32.png",
+      "sizes": "32x32",
+      "type": "image/png"
+    },
+    {
+      "src": "apple-touch-icon.png",
+      "sizes": "180x180",
+      "type": "image/png"
+    },
+    {
+      "src": "icon-192.png",
+      "sizes": "192x192",
+      "type": "image/png"
+    },
+    {
+      "src": "icon-512.png",
+      "sizes": "512x512",
+      "type": "image/png"
+    }
+  ]
+}
