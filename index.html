@@ -2026,6 +2026,7 @@ function KunKatsuApp() {
                             spot.count,
                             "\u56DE")));
                 }))) : (React.createElement("p", { className: `text-[11px] mt-1 ${theme.textMuted}` }, "\u304A\u3055\u3093\u307D\u8A18\u9332\u304C\u5897\u3048\u308B\u3068\u3001\u3088\u304F\u7ACB\u3061\u5BC4\u308B\u5834\u6240\u304C\u81EA\u52D5\u3067\u30E9\u30F3\u30AD\u30F3\u30B0\u3055\u308C\u307E\u3059\u3002"))))),
+        activeTab === 'stats' && (React.createElement(StatsDashboard, { walks: allWalks, darkMode: darkMode })),
         activeTab === 'settings' && profile && (React.createElement("section", { className: "p-4 flex flex-col gap-3 text-xs" },
             React.createElement("h2", { className: "text-base font-bold flex items-center gap-2" },
                 React.createElement("span", null, "\u2699\uFE0F"),
@@ -2090,19 +2091,22 @@ function KunKatsuApp() {
                         URL.revokeObjectURL(showShareModalUrl);
                         setShowShareModalUrl(null);
                     }, className: `w-full py-2.5 rounded-full text-xs font-bold active:scale-95 transition mt-1 ${theme.secondaryBtn}` }, "\u3068\u3058\u308B")))),
-        React.createElement("nav", { className: `fixed bottom-0 inset-x-0 ${theme.nav} border-t backdrop-blur flex justify-around items-center py-2 px-2 z-40` },
-            React.createElement("button", { onClick: () => setActiveTab('walk'), className: `flex flex-col items-center justify-center py-1 px-3.5 rounded-full text-xs transition-all ${activeTab === 'walk' ? theme.navItemActive : theme.navItemInactive}` },
+        React.createElement("nav", { className: `fixed bottom-0 inset-x-0 ${theme.nav} border-t backdrop-blur flex justify-around items-center py-2 px-1.5 gap-0.5 z-40` },
+            React.createElement("button", { onClick: () => setActiveTab('walk'), className: `flex-1 min-w-0 flex flex-col items-center justify-center py-1 px-1 rounded-full text-xs transition-all whitespace-nowrap ${activeTab === 'walk' ? theme.navItemActive : theme.navItemInactive}` },
                 React.createElement("span", { className: "text-base leading-none" }, "\uD83D\uDC3E"),
-                React.createElement("span", { className: "text-[11px] mt-0.5" }, "\u304A\u3055\u3093\u307D")),
-            React.createElement("button", { onClick: () => setActiveTab('summary'), className: `flex flex-col items-center justify-center py-1 px-3.5 rounded-full text-xs transition-all ${activeTab === 'summary' ? theme.navItemActive : theme.navItemInactive}` },
+                React.createElement("span", { className: "text-[10px] sm:text-[11px] mt-0.5 leading-tight" }, "\u304A\u3055\u3093\u307D")),
+            React.createElement("button", { onClick: () => setActiveTab('summary'), className: `flex-1 min-w-0 flex flex-col items-center justify-center py-1 px-1 rounded-full text-xs transition-all whitespace-nowrap ${activeTab === 'summary' ? theme.navItemActive : theme.navItemInactive}` },
                 React.createElement("span", { className: "text-base leading-none" }, "\uD83D\uDCD6"),
-                React.createElement("span", { className: "text-[11px] mt-0.5" }, "\u3075\u308A\u304B\u3048\u308A")),
-            React.createElement("button", { onClick: () => setActiveTab('heatmap'), className: `flex flex-col items-center justify-center py-1 px-3.5 rounded-full text-xs transition-all ${activeTab === 'heatmap' ? theme.navItemActive : theme.navItemInactive}` },
+                React.createElement("span", { className: "text-[10px] sm:text-[11px] mt-0.5 leading-tight" }, "\u3075\u308A\u304B\u3048\u308A")),
+            React.createElement("button", { onClick: () => setActiveTab('heatmap'), className: `flex-1 min-w-0 flex flex-col items-center justify-center py-1 px-1 rounded-full text-xs transition-all whitespace-nowrap ${activeTab === 'heatmap' ? theme.navItemActive : theme.navItemInactive}` },
                 React.createElement("span", { className: "text-base leading-none" }, "\uD83D\uDDFA\uFE0F"),
-                React.createElement("span", { className: "text-[11px] mt-0.5" }, "\u30DE\u30C3\u30D7")),
-            React.createElement("button", { onClick: () => setActiveTab('settings'), className: `flex flex-col items-center justify-center py-1 px-3.5 rounded-full text-xs transition-all ${activeTab === 'settings' ? theme.navItemActive : theme.navItemInactive}` },
+                React.createElement("span", { className: "text-[10px] sm:text-[11px] mt-0.5 leading-tight" }, "\u30DE\u30C3\u30D7")),
+            React.createElement("button", { onClick: () => setActiveTab('stats'), className: `flex-1 min-w-0 flex flex-col items-center justify-center py-1 px-1 rounded-full text-xs transition-all whitespace-nowrap ${activeTab === 'stats' ? theme.navItemActive : theme.navItemInactive}` },
+                React.createElement("span", { className: "text-base leading-none" }, "\uD83D\uDCCA"),
+                React.createElement("span", { className: "text-[10px] sm:text-[11px] mt-0.5 leading-tight" }, "\u304D\u308D\u304F")),
+            React.createElement("button", { onClick: () => setActiveTab('settings'), className: `flex-1 min-w-0 flex flex-col items-center justify-center py-1 px-1 rounded-full text-xs transition-all whitespace-nowrap ${activeTab === 'settings' ? theme.navItemActive : theme.navItemInactive}` },
                 React.createElement("span", { className: "text-base leading-none" }, "\u2699\uFE0F"),
-                React.createElement("span", { className: "text-[11px] mt-0.5" }, "\u8A2D\u5B9A")))));
+                React.createElement("span", { className: "text-[10px] sm:text-[11px] mt-0.5 leading-tight" }, "\u8A2D\u5B9A")))));
 }
 
 
