@@ -618,6 +618,494 @@ function generateShareCardBlob(walk, dogName = '愛犬') {
 }
 
 
+// --- stats.ts ---
+/** 除外ルールの定数（D3合意） */
+const STATS_MIN_DURATION_SEC = 60;
+const STATS_MIN_DISTANCE_METERS = 50;
+const STATS_DEMO_ID_PREFIX = 'demo_';
+/** 数値が有限かつ0以上であればそのまま、そうでなければ0を返す */
+function safeNonNegative(value) {
+    return typeof value === 'number' && Number.isFinite(value) && value > 0 ? value : 0;
+}
+/** 1セッション分のクン活秒数を散歩時間の上限で丸める */
+function getClampedSniffSec(walk) {
+    const duration = safeNonNegative(walk.durationSec);
+    const sniff = safeNonNegative(walk.sniffDurationSec);
+    return Math.min(sniff, duration);
+}
+/** ローカルタイムゾーンで YYYY-MM-DD 文字列を返す */
+function toLocalDateKey(timestampMs) {
+    const d = new Date(timestampMs);
+    const year = d.getFullYear();
+    const month = String(d.getMonth() + 1).padStart(2, '0');
+    const day = String(d.getDate()).padStart(2, '0');
+    return `${year}-${month}-${day}`;
+}
+/** ローカルタイムゾーンで YYYY/MM/DD 表示用文字列を返す */
+function formatLocalDate(timestampMs) {
+    const d = new Date(timestampMs);
+    const year = d.getFullYear();
+    const month = String(d.getMonth() + 1).padStart(2, '0');
+    const day = String(d.getDate()).padStart(2, '0');
+    return `${year}/${month}/${day}`;
+}
+/** D3ルールに基づき1件の散歩データが集計除外対象かを判定する */
+function getWalkExclusionReason(walk) {
+    if (typeof walk.id !== 'string' || walk.id.startsWith(STATS_DEMO_ID_PREFIX)) {
+        return 'demo';
+    }
+    if (!Number.isFinite(walk.durationSec) ||
+        !Number.isFinite(walk.distanceMeters) ||
+        walk.durationSec < STATS_MIN_DURATION_SEC ||
+        walk.distanceMeters < STATS_MIN_DISTANCE_METERS) {
+        return 'short';
+    }
+    return null;
+}
+/** 既存のヒートマップ画面と同じ基準で期間フィルタを適用する */
+function filterWalksByPeriod(walks, period, nowMs = Date.now()) {
+    if (period === 'all') {
+        return [...walks];
+    }
+    const periodDays = period === 'week' ? 7 : 30;
+    const cutoff = nowMs - periodDays * 24 * 60 * 60 * 1000;
+    return walks.filter((w) => Number.isFinite(w.startTime) && w.startTime >= cutoff);
+}
+/** 期間フィルタとD3除外ルールを適用し、有効データと除外件数を返す（タスク 1.2） */
+function filterWalksForStats(walks, period, nowMs = Date.now()) {
+    let totalExcludedCount = 0;
+    for (const walk of walks) {
+        if (getWalkExclusionReason(walk) !== null) {
+            totalExcludedCount += 1;
+        }
+    }
+    const periodWalks = filterWalksByPeriod(walks, period, nowMs);
+    const validWalks = [];
+    let excludedDemoCount = 0;
+    let excludedShortCount = 0;
+    for (const walk of periodWalks) {
+        const reason = getWalkExclusionReason(walk);
+        if (reason === 'demo') {
+            excludedDemoCount += 1;
+        }
+        else if (reason === 'short') {
+            excludedShortCount += 1;
+        }
+        else {
+            validWalks.push(walk);
+        }
+    }
+    return {
+        validWalks,
+        excludedCount: excludedDemoCount + excludedShortCount,
+        excludedDemoCount,
+        excludedShortCount,
+        totalExcludedCount,
+    };
+}
+/** 累計・1回あたり平均・加重平均時速・正味の歩く速さ・クン活率を算出する（タスク 1.3） */
+function calculateWalkSummary(validWalks) {
+    let totalDistanceMeters = 0;
+    let totalDurationSec = 0;
+    let totalSniffDurationSec = 0;
+    let totalOwnerCaloriesKcal = 0;
+    let totalPeeCount = 0;
+    let totalPoopCount = 0;
+    for (const walk of validWalks) {
+        totalDistanceMeters += safeNonNegative(walk.distanceMeters);
+        totalDurationSec += safeNonNegative(walk.durationSec);
+        totalSniffDurationSec += getClampedSniffSec(walk);
+        totalOwnerCaloriesKcal += safeNonNegative(walk.ownerCaloriesKcal);
+        if (Array.isArray(walk.actionLogs)) {
+            for (const log of walk.actionLogs) {
+                if (log.type === 'pee') {
+                    totalPeeCount += 1;
+                }
+                else if (log.type === 'poop') {
+                    totalPoopCount += 1;
+                }
+            }
+        }
+    }
+    const totalWalks = validWalks.length;
+    const avgDistanceMeters = totalWalks > 0 ? totalDistanceMeters / totalWalks : 0;
+    const avgDurationSec = totalWalks > 0 ? totalDurationSec / totalWalks : 0;
+    const avgSniffDurationSec = totalWalks > 0 ? totalSniffDurationSec / totalWalks : 0;
+    // 1回ごとの時速の単純平均だと短時間散歩が全体を歪めるため、Σ距離 ÷ Σ時間 で加重平均を算出
+    const avgSpeedKmh = totalDurationSec > 0 ? (totalDistanceMeters * 3.6) / totalDurationSec : null;
+    const netWalkingSec = totalDurationSec - totalSniffDurationSec;
+    const netSpeedKmh = netWalkingSec > 0 ? (totalDistanceMeters * 3.6) / netWalkingSec : null;
+    const sniffRatioPercent = totalDurationSec > 0 ? (totalSniffDurationSec / totalDurationSec) * 100 : 0;
+    return {
+        totalWalks,
+        totalDistanceMeters,
+        totalDurationSec,
+        totalSniffDurationSec,
+        totalOwnerCaloriesKcal,
+        totalPeeCount,
+        totalPoopCount,
+        avgDistanceMeters,
+        avgDurationSec,
+        avgSniffDurationSec,
+        avgSpeedKmh,
+        netSpeedKmh,
+        sniffRatioPercent,
+    };
+}
+/** 評価関数に基づきベスト記録1件を選出する共通ヘルパー（同値はより新しい回を優先） */
+function pickBestWalk(validWalks, getMetric, requirePositive) {
+    let bestWalk = null;
+    let bestValue = -Infinity;
+    for (const walk of validWalks) {
+        const value = getMetric(walk);
+        if (requirePositive && value <= 0) {
+            continue;
+        }
+        const startTime = Number.isFinite(walk.startTime) ? walk.startTime : 0;
+        const bestStartTime = bestWalk && Number.isFinite(bestWalk.startTime) ? bestWalk.startTime : -Infinity;
+        if (bestWalk === null || value > bestValue || (value === bestValue && startTime > bestStartTime)) {
+            bestWalk = walk;
+            bestValue = value;
+        }
+    }
+    if (!bestWalk) {
+        return null;
+    }
+    const startTime = Number.isFinite(bestWalk.startTime) ? bestWalk.startTime : 0;
+    return {
+        walkId: bestWalk.id,
+        startTime,
+        dateLabel: formatLocalDate(startTime),
+        distanceMeters: safeNonNegative(bestWalk.distanceMeters),
+        durationSec: safeNonNegative(bestWalk.durationSec),
+        sniffDurationSec: getClampedSniffSec(bestWalk),
+    };
+}
+/** 自己ベスト（最長距離・最長時間・最長クン活）を算出する（タスク 1.4） */
+function calculatePersonalBests(validWalks) {
+    return {
+        longestDistance: pickBestWalk(validWalks, (w) => safeNonNegative(w.distanceMeters), false),
+        longestDuration: pickBestWalk(validWalks, (w) => safeNonNegative(w.durationSec), false),
+        // クン活が全回0秒のときは「未記録」として null を返す
+        longestSniff: pickBestWalk(validWalks, (w) => getClampedSniffSec(w), true),
+    };
+}
+const MS_PER_DAY = 24 * 60 * 60 * 1000;
+/** タイムスタンプを有効な Date に変換し、不正値なら null を返す */
+function toValidLocalDate(timestampMs) {
+    if (!Number.isFinite(timestampMs)) {
+        return null;
+    }
+    const d = new Date(timestampMs);
+    return Number.isNaN(d.getTime()) ? null : d;
+}
+/** ローカル時刻の年月日を通算日番号へ変換する（DST の 23h/25h 日を跨いでも 1 日=1 差を保証） */
+function toLocalDayIndex(localDate) {
+    const utcMidnight = new Date(0);
+    utcMidnight.setUTCFullYear(localDate.getFullYear(), localDate.getMonth(), localDate.getDate());
+    utcMidnight.setUTCHours(0, 0, 0, 0);
+    return Math.round(utcMidnight.getTime() / MS_PER_DAY);
+}
+/** 指定日から遡って連続して散歩した日数を数える */
+function countBackwardStreak(daySet, startDayIndex) {
+    let days = 0;
+    let cursor = startDayIndex;
+    while (daySet.has(cursor)) {
+        days += 1;
+        cursor -= 1;
+    }
+    return days;
+}
+/** 昇順ソート済みの日番号配列から最長連続日数を算出する */
+function calculateBestStreak(sortedDays) {
+    let best = 0;
+    let run = 0;
+    let prevDay = null;
+    for (const dayIndex of sortedDays) {
+        run = prevDay !== null && dayIndex === prevDay + 1 ? run + 1 : 1;
+        if (run > best) {
+            best = run;
+        }
+        prevDay = dayIndex;
+    }
+    return best;
+}
+/** 連続散歩日数（現在／最長）と今月の散歩日数を算出する（タスク 1.5） */
+function calculateStreaks(validWalks, nowMs = Date.now()) {
+    const nowDate = toValidLocalDate(nowMs) ?? new Date();
+    const currentYear = nowDate.getFullYear();
+    const currentMonth = nowDate.getMonth();
+    const todayIndex = toLocalDayIndex(nowDate);
+    const daySet = new Set();
+    const thisMonthDaySet = new Set();
+    for (const walk of validWalks) {
+        // 1回の夜間散歩で2日分稼がないよう、かつ他指標と整合させるため開始時刻のローカル日付で丸める
+        const localDate = toValidLocalDate(walk.startTime);
+        if (!localDate) {
+            continue;
+        }
+        const dayIndex = toLocalDayIndex(localDate);
+        daySet.add(dayIndex);
+        if (localDate.getFullYear() === currentYear && localDate.getMonth() === currentMonth) {
+            thisMonthDaySet.add(dayIndex);
+        }
+    }
+    if (daySet.size === 0) {
+        return { currentDays: 0, bestDays: 0, thisMonthDays: 0 };
+    }
+    // 今日未実施でも昨日歩いていれば現在の連続記録は継続中とみなす
+    const streakAnchor = daySet.has(todayIndex)
+        ? todayIndex
+        : daySet.has(todayIndex - 1)
+            ? todayIndex - 1
+            : null;
+    const currentDays = streakAnchor !== null ? countBackwardStreak(daySet, streakAnchor) : 0;
+    const sortedDays = Array.from(daySet).sort((a, b) => a - b);
+    const bestDays = calculateBestStreak(sortedDays);
+    return {
+        currentDays,
+        bestDays,
+        thisMonthDays: thisMonthDaySet.size,
+    };
+}
+const WEEKLY_BAR_COUNT = 8;
+const MONTHLY_BAR_COUNT = 6;
+/** 通算日番号からローカル暦日の年月日を復元する */
+function dayIndexToLocalParts(dayIndex) {
+    const utcDate = new Date(dayIndex * MS_PER_DAY);
+    return {
+        year: utcDate.getUTCFullYear(),
+        month: utcDate.getUTCMonth(),
+        day: utcDate.getUTCDate(),
+    };
+}
+/** ローカル日付が属する週（月曜始まり）の月曜日通算日番号を返す */
+function getMondayWeekStartDayIndex(localDate) {
+    const offsetFromMonday = (localDate.getDay() + 6) % 7;
+    return toLocalDayIndex(localDate) - offsetFromMonday;
+}
+/** 前期間比（%）を算出する。前期間が0以下のときは null を返す */
+function calculateComparisonPercent(current, previous) {
+    if (!Number.isFinite(previous) || previous <= 0) {
+        return null;
+    }
+    return ((current - previous) / previous) * 100;
+}
+/** 週別（直近8週・月曜始まり）・月別（直近6ヶ月）の距離推移と前期間比を算出する（タスク 1.6） */
+function calculateTrends(validWalks, nowMs = Date.now()) {
+    const nowDate = toValidLocalDate(nowMs) ?? new Date();
+    const currentWeekStart = getMondayWeekStartDayIndex(nowDate);
+    const firstWeekStart = currentWeekStart - (WEEKLY_BAR_COUNT - 1) * 7;
+    const weeklyBars = [];
+    const weekBucketMap = new Map();
+    for (let i = 0; i < WEEKLY_BAR_COUNT; i += 1) {
+        const weekStart = firstWeekStart + i * 7;
+        const { year, month, day } = dayIndexToLocalParts(weekStart);
+        const item = {
+            key: `${year}-${String(month + 1).padStart(2, '0')}-${String(day).padStart(2, '0')}`,
+            label: `${month + 1}/${day}`,
+            distanceMeters: 0,
+            durationSec: 0,
+            walkCount: 0,
+        };
+        weeklyBars.push(item);
+        weekBucketMap.set(weekStart, item);
+    }
+    const currentMonthSerial = nowDate.getFullYear() * 12 + nowDate.getMonth();
+    const firstMonthSerial = currentMonthSerial - (MONTHLY_BAR_COUNT - 1);
+    const monthlyBars = [];
+    const monthBucketMap = new Map();
+    for (let i = 0; i < MONTHLY_BAR_COUNT; i += 1) {
+        const serial = firstMonthSerial + i;
+        const year = Math.floor(serial / 12);
+        const month = serial - year * 12;
+        const item = {
+            key: `${year}-${String(month + 1).padStart(2, '0')}`,
+            label: `${month + 1}月`,
+            distanceMeters: 0,
+            durationSec: 0,
+            walkCount: 0,
+        };
+        monthlyBars.push(item);
+        monthBucketMap.set(serial, item);
+    }
+    for (const walk of validWalks) {
+        const localDate = toValidLocalDate(walk.startTime);
+        if (!localDate) {
+            continue;
+        }
+        const distance = safeNonNegative(walk.distanceMeters);
+        const duration = safeNonNegative(walk.durationSec);
+        const weekBucket = weekBucketMap.get(getMondayWeekStartDayIndex(localDate));
+        if (weekBucket) {
+            weekBucket.distanceMeters += distance;
+            weekBucket.durationSec += duration;
+            weekBucket.walkCount += 1;
+        }
+        const monthBucket = monthBucketMap.get(localDate.getFullYear() * 12 + localDate.getMonth());
+        if (monthBucket) {
+            monthBucket.distanceMeters += distance;
+            monthBucket.durationSec += duration;
+            monthBucket.walkCount += 1;
+        }
+    }
+    const latestWeek = weeklyBars[weeklyBars.length - 1];
+    const prevWeek = weeklyBars[weeklyBars.length - 2];
+    const latestMonth = monthlyBars[monthlyBars.length - 1];
+    const prevMonth = monthlyBars[monthlyBars.length - 2];
+    return {
+        weeklyBars,
+        monthlyBars,
+        weeklyComparisonPercent: latestWeek && prevWeek
+            ? calculateComparisonPercent(latestWeek.distanceMeters, prevWeek.distanceMeters)
+            : null,
+        monthlyComparisonPercent: latestMonth && prevMonth
+            ? calculateComparisonPercent(latestMonth.distanceMeters, prevMonth.distanceMeters)
+            : null,
+    };
+}
+const TIME_SLOT_DEFS = [
+    { id: 'morning', label: '朝', rangeLabel: '5〜10時' },
+    { id: 'noon', label: '昼', rangeLabel: '10〜15時' },
+    { id: 'evening', label: '夕', rangeLabel: '15〜19時' },
+    { id: 'night', label: '夜', rangeLabel: '19〜5時' },
+];
+/** 表示順（月〜日）と Date.getDay() の dayIndex 対応表 */
+const DAY_OF_WEEK_ORDER = [
+    { dayIndex: 1, label: '月' },
+    { dayIndex: 2, label: '火' },
+    { dayIndex: 3, label: '水' },
+    { dayIndex: 4, label: '木' },
+    { dayIndex: 5, label: '金' },
+    { dayIndex: 6, label: '土' },
+    { dayIndex: 0, label: '日' },
+];
+/** ローカル時刻の時（0〜23）を時間帯区分IDへ変換する */
+function resolveTimeSlotId(localHour) {
+    if (localHour >= 5 && localHour < 10)
+        return 'morning';
+    if (localHour >= 10 && localHour < 15)
+        return 'noon';
+    if (localHour >= 15 && localHour < 19)
+        return 'evening';
+    return 'night';
+}
+/** 時間帯分布（朝/昼/夕/夜）と曜日別の散歩回数を算出する（タスク 1.7） */
+function calculatePatterns(validWalks) {
+    const slotCounts = new Map(TIME_SLOT_DEFS.map((s) => [s.id, 0]));
+    const dayCounts = new Map(DAY_OF_WEEK_ORDER.map((d) => [d.dayIndex, 0]));
+    let countedWalks = 0;
+    for (const walk of validWalks) {
+        const localDate = toValidLocalDate(walk.startTime);
+        if (!localDate) {
+            continue;
+        }
+        countedWalks += 1;
+        const slotId = resolveTimeSlotId(localDate.getHours());
+        slotCounts.set(slotId, (slotCounts.get(slotId) ?? 0) + 1);
+        const dayIndex = localDate.getDay();
+        dayCounts.set(dayIndex, (dayCounts.get(dayIndex) ?? 0) + 1);
+    }
+    const timeSlots = TIME_SLOT_DEFS.map((def) => {
+        const count = slotCounts.get(def.id) ?? 0;
+        return {
+            id: def.id,
+            label: def.label,
+            rangeLabel: def.rangeLabel,
+            count,
+            percent: countedWalks > 0 ? (count / countedWalks) * 100 : 0,
+        };
+    });
+    const dayOfWeek = DAY_OF_WEEK_ORDER.map((def) => ({
+        dayIndex: def.dayIndex,
+        label: def.label,
+        count: dayCounts.get(def.dayIndex) ?? 0,
+    }));
+    return {
+        timeSlots,
+        dayOfWeek,
+    };
+}
+const POOP_CONDITION_DEFS = [
+    { condition: 'normal', label: 'ふつう' },
+    { condition: 'soft', label: 'やわらかい' },
+    { condition: 'hard', label: 'かたい' },
+    { condition: 'unset', label: '未選択' },
+];
+/** うんち状態（ふつう/やわらかい/かたい/未選択）の件数と割合を算出する（タスク 1.8） */
+function calculatePoopStats(validWalks) {
+    const counts = new Map(POOP_CONDITION_DEFS.map((d) => [d.condition, 0]));
+    let totalCount = 0;
+    for (const walk of validWalks) {
+        if (!Array.isArray(walk.actionLogs)) {
+            continue;
+        }
+        for (const log of walk.actionLogs) {
+            if (log.type !== 'poop') {
+                continue;
+            }
+            const key = log.poopCondition === 'normal' ||
+                log.poopCondition === 'soft' ||
+                log.poopCondition === 'hard'
+                ? log.poopCondition
+                : 'unset';
+            counts.set(key, (counts.get(key) ?? 0) + 1);
+            totalCount += 1;
+        }
+    }
+    const items = POOP_CONDITION_DEFS.map((def) => {
+        const count = counts.get(def.condition) ?? 0;
+        return {
+            condition: def.condition,
+            label: def.label,
+            count,
+            percent: totalCount > 0 ? (count / totalCount) * 100 : 0,
+        };
+    });
+    return {
+        totalCount,
+        items,
+    };
+}
+const MILESTONE_UNIT_NAME = 'フルマラソン';
+const MILESTONE_UNIT_DISTANCE_METERS = 42195;
+/** 累計距離のマイルストーン換算（フルマラソン42.195km換算）を算出する（タスク 1.9） */
+function calculateMilestone(totalDistanceMeters) {
+    const safeDistance = safeNonNegative(totalDistanceMeters);
+    const completedUnits = Math.floor(safeDistance / MILESTONE_UNIT_DISTANCE_METERS);
+    const remainderMeters = safeDistance - completedUnits * MILESTONE_UNIT_DISTANCE_METERS;
+    const currentUnitProgressRatio = Math.min(1, Math.max(0, remainderMeters / MILESTONE_UNIT_DISTANCE_METERS));
+    const remainingMetersToNext = Math.max(0, MILESTONE_UNIT_DISTANCE_METERS - remainderMeters);
+    return {
+        unitName: MILESTONE_UNIT_NAME,
+        unitDistanceMeters: MILESTONE_UNIT_DISTANCE_METERS,
+        completedUnits,
+        currentUnitProgressRatio,
+        remainingMetersToNext,
+    };
+}
+/** 散歩データ配列と期間フィルタから統計ダッシュボードの全指標を一括算出する（Phase 1 統合） */
+function calculateWalkStats(walks, period, nowMs = Date.now()) {
+    const filtered = filterWalksForStats(walks, period, nowMs);
+    const allValidWalks = period === 'all' ? filtered.validWalks : filterWalksForStats(walks, 'all', nowMs).validWalks;
+    const summary = calculateWalkSummary(filtered.validWalks);
+    return {
+        period,
+        excludedCount: filtered.excludedCount,
+        excludedDemoCount: filtered.excludedDemoCount,
+        excludedShortCount: filtered.excludedShortCount,
+        summary,
+        bests: calculatePersonalBests(filtered.validWalks),
+        // 連続日数・今月の散歩日数・推移グラフは表示期間フィルタに影響されない全有効記録で算出する
+        streak: calculateStreaks(allValidWalks, nowMs),
+        trends: calculateTrends(allValidWalks, nowMs),
+        patterns: calculatePatterns(filtered.validWalks),
+        poop: calculatePoopStats(filtered.validWalks),
+        milestone: calculateMilestone(summary.totalDistanceMeters),
+    };
+}
+
+
 // --- DualMap.tsx ---
 function DualMap({ engine, mapboxToken, darkMode, centerLat, centerLng, routePoints, actionLogs, activeLayer, }) {
     const containerRef = useRef(null);
@@ -1165,6 +1653,564 @@ function HoldToRecordButton({ icon, label, accent = 'sky', onRecord, }) {
         React.createElement("div", { className: `absolute inset-x-0 bottom-0 pointer-events-none transition-none ${fillBgClass}`, style: { height: `${progress}%` } }),
         React.createElement("span", { className: "relative z-10 text-lg leading-none pointer-events-none" }, icon),
         React.createElement("span", { className: "relative z-10 text-[9px] font-semibold tracking-tight mt-1 pointer-events-none" }, isHolding ? `${progress}%` : label)));
+}
+
+
+// --- StatsDashboard.tsx ---
+const PERIOD_OPTIONS = [
+    { value: 'week', label: '直近1週間' },
+    { value: 'month', label: '直近1ヶ月' },
+    { value: 'all', label: '全期間' },
+];
+const TREND_GRANULARITY_OPTIONS = [
+    { value: 'weekly', label: '週別（8週）' },
+    { value: 'monthly', label: '月別（6ヶ月）' },
+];
+const POOP_SEGMENT_STYLE = {
+    normal: { light: 'bg-emerald-500', dark: 'bg-emerald-400' },
+    soft: { light: 'bg-amber-400', dark: 'bg-amber-400' },
+    hard: { light: 'bg-rose-400', dark: 'bg-rose-400' },
+    unset: { light: 'bg-stone-300', dark: 'bg-[#5A5275]' },
+};
+/**
+ * 距離（メートル）をモバイル表示に適した単位（m / km）へ整形する
+ */
+function formatDistanceLabel(meters) {
+    if (!Number.isFinite(meters) || meters <= 0) {
+        return '0 m';
+    }
+    if (meters < 1000) {
+        return `${Math.round(meters).toLocaleString('ja-JP')} m`;
+    }
+    const km = meters / 1000;
+    const formattedKm = km >= 100
+        ? km.toFixed(1)
+        : km.toFixed(2).replace(/\.00$/, '').replace(/(\.\d)0$/, '$1');
+    return `${formattedKm} km`;
+}
+/**
+ * 秒数を日本語の時間表記（例: 1時間25分 / 12分30秒 / 45秒）へ整形する
+ */
+function formatDurationLabel(seconds) {
+    if (!Number.isFinite(seconds) || seconds <= 0) {
+        return '0秒';
+    }
+    const totalSec = Math.round(seconds);
+    const hours = Math.floor(totalSec / 3600);
+    const mins = Math.floor((totalSec % 3600) / 60);
+    const secs = totalSec % 60;
+    if (hours > 0) {
+        return `${hours.toLocaleString('ja-JP')}時間${mins}分`;
+    }
+    if (mins > 0) {
+        return `${mins}分${secs}秒`;
+    }
+    return `${secs}秒`;
+}
+/**
+ * 時速（km/h）を整形する。算出不能時（null / 非有限値）は "-- km/h" を返す
+ */
+function formatSpeedLabel(speedKmh) {
+    if (speedKmh === null || !Number.isFinite(speedKmh) || speedKmh < 0) {
+        return '-- km/h';
+    }
+    return `${speedKmh.toFixed(1)} km/h`;
+}
+/**
+ * パーセンテージを小数第1位まで整形する
+ */
+function formatPercentLabel(percent) {
+    if (!Number.isFinite(percent) || percent <= 0) {
+        return '0.0%';
+    }
+    const clamped = Math.min(100, Math.max(0, percent));
+    return `${clamped.toFixed(1)}%`;
+}
+/**
+ * 前期間比（%）を符号付き文字列へ整形する。算出不能時（null / 非有限値）は "--" を返す
+ */
+function formatComparisonPercentLabel(percent) {
+    if (percent === null || !Number.isFinite(percent)) {
+        return '--';
+    }
+    if (Math.abs(percent) < 0.05) {
+        return '±0.0%';
+    }
+    const sign = percent > 0 ? '+' : '';
+    return `${sign}${percent.toFixed(1)}%`;
+}
+function StatsDashboard({ walks, darkMode, initialPeriod = 'all', initialTrendGranularity = 'weekly', }) {
+    const [period, setPeriod] = useState(initialPeriod);
+    const [trendGranularity, setTrendGranularity] = useState(initialTrendGranularity);
+    const stats = useMemo(() => calculateWalkStats(walks, period), [walks, period]);
+    const ui = useMemo(() => darkMode
+        ? {
+            card: 'bg-[#28243A] border border-[#3A3450] shadow-sm',
+            subCard: 'bg-[#1C1A27]/70 border border-[#3A3450]',
+            textPrimary: 'text-[#F5EFE6]',
+            textSecondary: 'text-[#B8AFA3]',
+            textMuted: 'text-[#8E857B]',
+            segmentTrack: 'bg-[#1C1A27] border border-[#3A3450]',
+            segmentActive: 'bg-[#28243A] text-[#F5EFE6] font-bold shadow-sm',
+            segmentInactive: 'text-[#B8AFA3] hover:text-[#F5EFE6]',
+            excludeBadge: 'bg-[#1C1A27]/80 border border-[#3A3450] text-[#B8AFA3]',
+            heroTile: 'bg-[#F0653A]/15 border border-[#F0653A]/35 text-[#FF8A65]',
+            statDistTile: 'bg-orange-900/30 border border-orange-800/40 text-[#FF8A65]',
+            statTimeTile: 'bg-emerald-900/30 border border-emerald-800/40 text-emerald-300',
+            statSniffTile: 'bg-amber-900/30 border border-amber-800/40 text-amber-300',
+            statCalTile: 'bg-rose-900/30 border border-rose-800/40 text-rose-300',
+            statPeeTile: 'bg-sky-900/30 border border-sky-800/40 text-sky-300',
+            statPoopTile: 'bg-violet-900/30 border border-violet-800/40 text-violet-300',
+            barTrack: 'bg-[#1C1A27] border border-[#3A3450]',
+            barFill: 'bg-[#FFD15C]',
+            compareUpBadge: 'bg-emerald-900/40 border border-emerald-700/50 text-emerald-300',
+            compareDownBadge: 'bg-rose-900/35 border border-rose-700/50 text-rose-300',
+            compareNeutralBadge: 'bg-[#1C1A27] border border-[#3A3450] text-[#B8AFA3]',
+            svgGridStroke: '#3A3450',
+            svgBaselineStroke: '#574F73',
+            svgAxisText: '#B8AFA3',
+            svgValueText: '#F5EFE6',
+            svgBarDefault: '#D98A6C',
+            svgBarLatest: '#FF8A65',
+            svgBarZero: '#4A4263',
+            patternTopRow: 'bg-[#FF8A65]/15 border border-[#FF8A65]/40',
+            patternTopBadge: 'bg-[#FF8A65]/25 text-[#FFB096]',
+            patternTopBar: 'bg-[#FF8A65]',
+            patternNormalBar: 'bg-[#D9A760]/80',
+            divider: 'border-[#3A3450]',
+        }
+        : {
+            card: 'bg-white border border-orange-100 shadow-sm shadow-orange-950/5',
+            subCard: 'bg-orange-50/50 border border-orange-100',
+            textPrimary: 'text-stone-800',
+            textSecondary: 'text-stone-500',
+            textMuted: 'text-stone-400',
+            segmentTrack: 'bg-orange-100/60 border border-orange-200/50',
+            segmentActive: 'bg-white text-stone-800 font-bold shadow-sm',
+            segmentInactive: 'text-stone-500 hover:text-stone-700',
+            excludeBadge: 'bg-orange-50/80 border border-orange-200/70 text-stone-500',
+            heroTile: 'bg-orange-50 border border-orange-200/80 text-[#F0653A]',
+            statDistTile: 'bg-orange-50 border border-orange-100 text-[#F0653A]',
+            statTimeTile: 'bg-emerald-50 border border-emerald-100 text-emerald-700',
+            statSniffTile: 'bg-amber-50 border border-amber-100 text-amber-800',
+            statCalTile: 'bg-rose-50 border border-rose-100 text-rose-600',
+            statPeeTile: 'bg-sky-50 border border-sky-100 text-sky-700',
+            statPoopTile: 'bg-violet-50 border border-violet-100 text-violet-700',
+            barTrack: 'bg-amber-100/60 border border-amber-200/60',
+            barFill: 'bg-[#F5C445]',
+            compareUpBadge: 'bg-emerald-50 border border-emerald-200 text-emerald-700',
+            compareDownBadge: 'bg-rose-50 border border-rose-200 text-rose-600',
+            compareNeutralBadge: 'bg-stone-100 border border-stone-200 text-stone-500',
+            svgGridStroke: '#F3E8D8',
+            svgBaselineStroke: '#E7D5C0',
+            svgAxisText: '#78716C',
+            svgValueText: '#44403C',
+            svgBarDefault: '#FDBA74',
+            svgBarLatest: '#F0653A',
+            svgBarZero: '#E7E5E4',
+            patternTopRow: 'bg-orange-50 border border-orange-200',
+            patternTopBadge: 'bg-[#F0653A]/15 text-[#D94E24]',
+            patternTopBar: 'bg-[#F0653A]',
+            patternNormalBar: 'bg-[#FBBF68]',
+            divider: 'border-orange-100',
+        }, [darkMode]);
+    const { summary, bests, streak, trends, patterns, poop, milestone } = stats;
+    const sniffRatioClamped = Number.isFinite(summary.sniffRatioPercent)
+        ? Math.min(100, Math.max(0, summary.sniffRatioPercent))
+        : 0;
+    const milestoneProgressPercent = Number.isFinite(milestone.currentUnitProgressRatio)
+        ? Math.min(100, Math.max(0, milestone.currentUnitProgressRatio * 100))
+        : 0;
+    // 2.6 週別／月別距離バーグラフ用の算出値
+    const trendBars = trendGranularity === 'weekly' ? trends.weeklyBars : trends.monthlyBars;
+    const trendComparisonPercent = trendGranularity === 'weekly'
+        ? trends.weeklyComparisonPercent
+        : trends.monthlyComparisonPercent;
+    const trendComparisonTitle = trendGranularity === 'weekly' ? '前週比' : '前月比';
+    const maxTrendDistance = trendBars.reduce((max, item) => {
+        const val = Number.isFinite(item.distanceMeters) ? Math.max(0, item.distanceMeters) : 0;
+        return val > max ? val : max;
+    }, 0);
+    const latestTrendBar = trendBars.length > 0 ? trendBars[trendBars.length - 1] : null;
+    const comparisonBadgeClass = trendComparisonPercent === null || !Number.isFinite(trendComparisonPercent)
+        ? ui.compareNeutralBadge
+        : trendComparisonPercent >= 0
+            ? ui.compareUpBadge
+            : ui.compareDownBadge;
+    // 2.8 時間帯分布・曜日別回数の最大値（0件時は強調しない）
+    const maxTimeSlotCount = patterns.timeSlots.reduce((max, slot) => (slot.count > max ? slot.count : max), 0);
+    const topTimeSlotSummary = maxTimeSlotCount > 0
+        ? patterns.timeSlots
+            .filter((slot) => slot.count === maxTimeSlotCount)
+            .map((slot) => slot.label)
+            .join('・')
+        : null;
+    const maxDayCount = patterns.dayOfWeek.reduce((max, day) => (day.count > max ? day.count : max), 0);
+    const topDaySummary = maxDayCount > 0
+        ? patterns.dayOfWeek
+            .filter((day) => day.count === maxDayCount)
+            .map((day) => `${day.label}曜`)
+            .join('・')
+        : null;
+    return (React.createElement("section", { className: "p-4 flex flex-col gap-3 max-w-md mx-auto w-full", "aria-label": "\u304A\u3055\u3093\u307D\u7D71\u8A08\u30C0\u30C3\u30B7\u30E5\u30DC\u30FC\u30C9" },
+        React.createElement("div", { className: "flex items-center justify-between gap-2" },
+            React.createElement("h2", { className: `text-base font-bold flex items-center gap-2 ${ui.textPrimary}` },
+                React.createElement("span", null, "\uD83D\uDCCA"),
+                React.createElement("span", null, "\u304A\u3055\u3093\u307D\u306E\u304D\u308D\u304F")),
+            stats.excludedCount > 0 && (React.createElement("span", { className: `text-[11px] px-2.5 py-0.5 rounded-full whitespace-nowrap ${ui.excludeBadge}`, title: "\u30C7\u30E2\u8A18\u9332\u30FB60\u79D2\u672A\u6E80\u30FB50m\u672A\u6E80\u306E\u6563\u6B69\u3092\u96C6\u8A08\u5BFE\u8C61\u304B\u3089\u9664\u5916\u3057\u3066\u3044\u307E\u3059" },
+                "\u9664\u5916",
+                stats.excludedCount,
+                "\u4EF6"))),
+        React.createElement("div", { role: "tablist", "aria-label": "\u96C6\u8A08\u671F\u9593", className: `grid grid-cols-3 gap-1 p-1 rounded-2xl text-xs ${ui.segmentTrack}` }, PERIOD_OPTIONS.map((opt) => {
+            const isActive = period === opt.value;
+            return (React.createElement("button", { key: opt.value, type: "button", role: "tab", "aria-selected": isActive, onClick: () => setPeriod(opt.value), className: `py-1.5 rounded-xl transition-all ${isActive ? ui.segmentActive : ui.segmentInactive}` }, opt.label));
+        })),
+        stats.excludedCount > 0 && (React.createElement("p", { className: `text-[11px] px-1 ${ui.textMuted}` }, "\u203B \u30B5\u30F3\u30D7\u30EB\u30C7\u30FC\u30BF\u3084\u77ED\u6642\u9593\u306E\u8A18\u9332\uFF0860\u79D2\u672A\u6E80\u30FB50m\u672A\u6E80\uFF09\u306F\u96C6\u8A08\u304B\u3089\u81EA\u52D5\u9664\u5916\u3055\u308C\u3066\u3044\u307E\u3059")),
+        summary.totalWalks === 0 ? (React.createElement("div", { className: `p-6 rounded-3xl text-center flex flex-col items-center gap-2 ${ui.card}` },
+            React.createElement("span", { className: "text-3xl leading-none" }, "\uD83D\uDC3E"),
+            React.createElement("p", { className: `text-sm font-bold ${ui.textPrimary}` }, "\u307E\u3060\u8A18\u9332\u304C\u3042\u308A\u307E\u305B\u3093"),
+            React.createElement("p", { className: `text-xs ${ui.textSecondary}` }, "\u300C\u304A\u3055\u3093\u307D\u300D\u30BF\u30D6\u304B\u3089\u6563\u6B69\u3092\u8A18\u9332\u3059\u308B\u3068\u3001\u8DDD\u96E2\u30FB\u30DA\u30FC\u30B9\u30FB\u30AF\u30F3\u6D3B\u306E\u7D71\u8A08\u304C\u3053\u3053\u306B\u8868\u793A\u3055\u308C\u307E\u3059\u3002"))) : (React.createElement(React.Fragment, null,
+            React.createElement("div", { className: `p-4 rounded-3xl flex flex-col gap-3 ${ui.card}` },
+                React.createElement("div", { className: "flex items-center justify-between gap-2" },
+                    React.createElement("h3", { className: `text-sm font-bold flex items-center gap-1.5 ${ui.textPrimary}` },
+                        React.createElement("span", null, "\uD83C\uDFC5"),
+                        React.createElement("span", null, "\u3053\u308C\u307E\u3067\u306E\u7D2F\u7A4D\u30C7\u30FC\u30BF")),
+                    React.createElement("span", { className: `text-[11px] ${ui.textMuted}` },
+                        "\u5BFE\u8C61 ",
+                        summary.totalWalks.toLocaleString('ja-JP'),
+                        "\u56DE")),
+                React.createElement("div", { className: "grid grid-cols-2 gap-2.5 text-xs" },
+                    React.createElement("div", { className: `col-span-2 p-3 rounded-2xl flex items-center justify-between ${ui.heroTile}` },
+                        React.createElement("div", null,
+                            React.createElement("span", { className: "text-[11px] font-medium block" }, "\uD83D\uDC3E \u7DCF\u304A\u3055\u3093\u307D\u56DE\u6570"),
+                            React.createElement("p", { className: "text-xl font-bold tabular-nums mt-0.5" },
+                                summary.totalWalks.toLocaleString('ja-JP'),
+                                " \u56DE")),
+                        React.createElement("span", { className: `text-[11px] px-2.5 py-1 rounded-full font-medium ${ui.subCard} ${ui.textSecondary}` }, PERIOD_OPTIONS.find((opt) => opt.value === period)?.label)),
+                    React.createElement("div", { className: `p-3 rounded-2xl ${ui.statDistTile}` },
+                        React.createElement("span", { className: "text-[11px] font-medium block" }, "\uD83D\uDCCF \u7DCF\u304D\u3087\u308A"),
+                        React.createElement("p", { className: "text-base font-bold tabular-nums mt-0.5 break-words" }, formatDistanceLabel(summary.totalDistanceMeters))),
+                    React.createElement("div", { className: `p-3 rounded-2xl ${ui.statTimeTile}` },
+                        React.createElement("span", { className: "text-[11px] font-medium block" }, "\u23F1\uFE0F \u7DCF\u304A\u3055\u3093\u307D\u6642\u9593"),
+                        React.createElement("p", { className: "text-base font-bold tabular-nums mt-0.5 break-words" }, formatDurationLabel(summary.totalDurationSec))),
+                    React.createElement("div", { className: `p-3 rounded-2xl ${ui.statSniffTile}` },
+                        React.createElement("span", { className: "text-[11px] font-medium block" }, "\uD83D\uDC43 \u7DCF\u30AF\u30F3\u6D3B\u6642\u9593"),
+                        React.createElement("p", { className: "text-base font-bold tabular-nums mt-0.5 break-words" }, formatDurationLabel(summary.totalSniffDurationSec))),
+                    React.createElement("div", { className: `p-3 rounded-2xl ${ui.statCalTile}` },
+                        React.createElement("span", { className: "text-[11px] font-medium block" }, "\uD83D\uDD25 \u7DCF\u6D88\u8CBB\u30AB\u30ED\u30EA\u30FC"),
+                        React.createElement("p", { className: "text-base font-bold tabular-nums mt-0.5 break-words" },
+                            Math.round(summary.totalOwnerCaloriesKcal).toLocaleString('ja-JP'),
+                            " kcal")),
+                    React.createElement("div", { className: `p-3 rounded-2xl ${ui.statPeeTile}` },
+                        React.createElement("span", { className: "text-[11px] font-medium block" }, "\uD83D\uDCA7 \u304A\u3057\u3063\u3053\u5408\u8A08"),
+                        React.createElement("p", { className: "text-base font-bold tabular-nums mt-0.5" },
+                            summary.totalPeeCount.toLocaleString('ja-JP'),
+                            " \u56DE")),
+                    React.createElement("div", { className: `p-3 rounded-2xl ${ui.statPoopTile}` },
+                        React.createElement("span", { className: "text-[11px] font-medium block" }, "\uD83D\uDCA9 \u3046\u3093\u3061\u5408\u8A08"),
+                        React.createElement("p", { className: "text-base font-bold tabular-nums mt-0.5" },
+                            summary.totalPoopCount.toLocaleString('ja-JP'),
+                            " \u56DE")))),
+            React.createElement("div", { className: `p-4 rounded-3xl flex flex-col gap-3 ${ui.card}` },
+                React.createElement("h3", { className: `text-sm font-bold flex items-center gap-1.5 ${ui.textPrimary}` },
+                    React.createElement("span", null, "\u26A1"),
+                    React.createElement("span", null, "1\u56DE\u3042\u305F\u308A\u306E\u5E73\u5747\u30FB\u30DA\u30FC\u30B9")),
+                React.createElement("div", { className: "grid grid-cols-2 gap-2.5 text-xs" },
+                    React.createElement("div", { className: `p-3 rounded-2xl ${ui.subCard}` },
+                        React.createElement("span", { className: `text-[11px] font-medium block ${ui.textSecondary}` }, "\uD83D\uDCD0 1\u56DE\u3042\u305F\u308A\u306E\u304D\u3087\u308A"),
+                        React.createElement("p", { className: `text-base font-bold tabular-nums mt-0.5 ${ui.textPrimary}` }, formatDistanceLabel(summary.avgDistanceMeters))),
+                    React.createElement("div", { className: `p-3 rounded-2xl ${ui.subCard}` },
+                        React.createElement("span", { className: `text-[11px] font-medium block ${ui.textSecondary}` }, "\u23F3 1\u56DE\u3042\u305F\u308A\u306E\u6642\u9593"),
+                        React.createElement("p", { className: `text-base font-bold tabular-nums mt-0.5 ${ui.textPrimary}` }, formatDurationLabel(summary.avgDurationSec))),
+                    React.createElement("div", { className: `p-3 rounded-2xl ${ui.subCard}` },
+                        React.createElement("span", { className: `text-[11px] font-medium block ${ui.textSecondary}` }, "\uD83D\uDC43 1\u56DE\u3042\u305F\u308A\u306E\u30AF\u30F3\u6D3B"),
+                        React.createElement("p", { className: `text-base font-bold tabular-nums mt-0.5 ${ui.textPrimary}` }, formatDurationLabel(summary.avgSniffDurationSec))),
+                    React.createElement("div", { className: `p-3 rounded-2xl ${ui.statSniffTile}` },
+                        React.createElement("span", { className: "text-[11px] font-medium block" }, "\uD83D\uDD0D \u30AF\u30F3\u6D3B\u6BD4\u7387"),
+                        React.createElement("p", { className: "text-base font-bold tabular-nums mt-0.5" }, formatPercentLabel(summary.sniffRatioPercent)))),
+                React.createElement("div", { className: `p-3 rounded-2xl flex flex-col gap-1.5 ${ui.subCard}` },
+                    React.createElement("div", { className: "flex items-center justify-between text-[11px]" },
+                        React.createElement("span", { className: ui.textSecondary }, "\u6563\u6B69\u6642\u9593\u306E\u3046\u3061\u30AF\u30F3\u6D3B\u3057\u3066\u3044\u305F\u5272\u5408"),
+                        React.createElement("span", { className: `font-bold tabular-nums ${ui.textPrimary}` }, formatPercentLabel(summary.sniffRatioPercent))),
+                    React.createElement("div", { className: `w-full h-2.5 rounded-full overflow-hidden ${ui.barTrack}` },
+                        React.createElement("div", { className: `h-full rounded-full transition-all duration-300 ${ui.barFill}`, style: { width: `${sniffRatioClamped}%` } }))),
+                React.createElement("div", { className: "grid grid-cols-2 gap-2.5 text-xs" },
+                    React.createElement("div", { className: `p-3 rounded-2xl ${ui.subCard}` },
+                        React.createElement("span", { className: `text-[11px] font-medium block ${ui.textSecondary}` }, "\uD83D\uDEB6 \u5E73\u5747\u6642\u901F\uFF08\u5168\u4F53\uFF09"),
+                        React.createElement("p", { className: `text-base font-bold tabular-nums mt-0.5 ${ui.textPrimary}` }, formatSpeedLabel(summary.avgSpeedKmh)),
+                        React.createElement("span", { className: `text-[10px] block mt-0.5 ${ui.textMuted}` }, "\u7DCF\u8DDD\u96E2 \u00F7 \u7DCF\u6642\u9593\u306E\u52A0\u91CD\u5E73\u5747")),
+                    React.createElement("div", { className: `p-3 rounded-2xl ${ui.subCard}` },
+                        React.createElement("span", { className: `text-[11px] font-medium block ${ui.textSecondary}` }, "\uD83D\uDC5F \u5B9F\u8CEA\u6B69\u884C\u6642\u901F"),
+                        React.createElement("p", { className: `text-base font-bold tabular-nums mt-0.5 ${ui.textPrimary}` }, formatSpeedLabel(summary.netSpeedKmh)),
+                        React.createElement("span", { className: `text-[10px] block mt-0.5 ${ui.textMuted}` }, "\u30AF\u30F3\u6D3B\u6642\u9593\u3092\u9664\u3044\u305F\u6B69\u901F")))),
+            React.createElement("div", { className: `p-4 rounded-3xl flex flex-col gap-3 ${ui.card}` },
+                React.createElement("h3", { className: `text-sm font-bold flex items-center gap-1.5 ${ui.textPrimary}` },
+                    React.createElement("span", null, "\uD83C\uDFC6"),
+                    React.createElement("span", null, "\u81EA\u5DF1\u30D9\u30B9\u30C8")),
+                React.createElement("div", { className: "flex flex-col gap-2 text-xs" }, [
+                    {
+                        key: 'longestDistance',
+                        icon: '📏',
+                        label: '最長きょり',
+                        record: bests.longestDistance,
+                        valueText: bests.longestDistance
+                            ? formatDistanceLabel(bests.longestDistance.distanceMeters)
+                            : '--',
+                        tileClass: ui.statDistTile,
+                    },
+                    {
+                        key: 'longestDuration',
+                        icon: '⏱️',
+                        label: '最長おさんぽ時間',
+                        record: bests.longestDuration,
+                        valueText: bests.longestDuration
+                            ? formatDurationLabel(bests.longestDuration.durationSec)
+                            : '--',
+                        tileClass: ui.statTimeTile,
+                    },
+                    {
+                        key: 'longestSniff',
+                        icon: '👃',
+                        label: '最長クン活時間',
+                        record: bests.longestSniff,
+                        valueText: bests.longestSniff
+                            ? formatDurationLabel(bests.longestSniff.sniffDurationSec)
+                            : '--',
+                        tileClass: ui.statSniffTile,
+                    },
+                ].map((item) => (React.createElement("div", { key: item.key, className: `p-3 rounded-2xl flex items-center justify-between gap-2 ${item.tileClass}` },
+                    React.createElement("div", { className: "flex items-center gap-2 min-w-0" },
+                        React.createElement("span", { className: "text-base leading-none shrink-0" }, item.icon),
+                        React.createElement("span", { className: "font-medium truncate" }, item.label)),
+                    React.createElement("div", { className: "text-right shrink-0" },
+                        React.createElement("p", { className: "text-sm font-bold tabular-nums leading-tight" }, item.valueText),
+                        React.createElement("span", { className: `text-[10px] tabular-nums block mt-0.5 ${ui.textMuted}` }, item.record ? item.record.dateLabel : '記録なし'))))))),
+            React.createElement("div", { className: `p-4 rounded-3xl flex flex-col gap-3 ${ui.card}` },
+                React.createElement("div", { className: "flex items-center justify-between gap-2" },
+                    React.createElement("h3", { className: `text-sm font-bold flex items-center gap-1.5 ${ui.textPrimary}` },
+                        React.createElement("span", null, "\uD83D\uDD25"),
+                        React.createElement("span", null, "\u7D99\u7D9A\u30FB\u304A\u3055\u3093\u307D\u7FD2\u6163")),
+                    React.createElement("span", { className: `text-[11px] ${ui.textMuted}` }, "\u5168\u671F\u9593\u57FA\u6E96")),
+                React.createElement("div", { className: "grid grid-cols-2 gap-2.5 text-xs" },
+                    React.createElement("div", { className: `p-3 rounded-2xl ${streak.currentDays > 0 ? ui.heroTile : ui.subCard}` },
+                        React.createElement("span", { className: `text-[11px] font-medium block ${streak.currentDays > 0 ? '' : ui.textSecondary}` }, "\uD83D\uDD25 \u73FE\u5728\u306E\u9023\u7D9A"),
+                        React.createElement("p", { className: `text-lg font-bold tabular-nums mt-0.5 ${streak.currentDays > 0 ? '' : ui.textPrimary}` },
+                            streak.currentDays.toLocaleString('ja-JP'),
+                            " \u65E5")),
+                    React.createElement("div", { className: `p-3 rounded-2xl ${ui.subCard}` },
+                        React.createElement("span", { className: `text-[11px] font-medium block ${ui.textSecondary}` }, "\uD83C\uDFC5 \u6700\u9577\u9023\u7D9A"),
+                        React.createElement("p", { className: `text-lg font-bold tabular-nums mt-0.5 ${ui.textPrimary}` },
+                            streak.bestDays.toLocaleString('ja-JP'),
+                            " \u65E5")),
+                    React.createElement("div", { className: `col-span-2 p-3 rounded-2xl flex items-center justify-between ${ui.statTimeTile}` },
+                        React.createElement("span", { className: "text-[11px] font-medium flex items-center gap-1.5" },
+                            React.createElement("span", null, "\uD83D\uDCC5"),
+                            React.createElement("span", null, "\u4ECA\u6708\u306E\u304A\u3055\u3093\u307D\u65E5\u6570")),
+                        React.createElement("p", { className: "text-base font-bold tabular-nums" },
+                            streak.thisMonthDays.toLocaleString('ja-JP'),
+                            " \u65E5")))),
+            React.createElement("div", { className: `p-4 rounded-3xl flex flex-col gap-3 ${ui.card}` },
+                React.createElement("div", { className: "flex items-center justify-between gap-2" },
+                    React.createElement("h3", { className: `text-sm font-bold flex items-center gap-1.5 ${ui.textPrimary}` },
+                        React.createElement("span", null, "\uD83D\uDCC8"),
+                        React.createElement("span", null, "\u304D\u3087\u308A\u306E\u63A8\u79FB")),
+                    React.createElement("span", { className: `text-[10px] ${ui.textMuted}` }, "\u5168\u671F\u9593\u57FA\u6E96")),
+                React.createElement("div", { className: "flex items-center justify-between gap-2 flex-wrap" },
+                    React.createElement("div", { role: "tablist", "aria-label": "\u63A8\u79FB\u30B0\u30E9\u30D5\u7C92\u5EA6", className: `inline-grid grid-cols-2 gap-1 p-1 rounded-xl text-[11px] ${ui.segmentTrack}` }, TREND_GRANULARITY_OPTIONS.map((opt) => {
+                        const isActive = trendGranularity === opt.value;
+                        return (React.createElement("button", { key: opt.value, type: "button", role: "tab", "aria-selected": isActive, onClick: () => setTrendGranularity(opt.value), className: `px-2.5 py-1 rounded-lg transition-all whitespace-nowrap ${isActive ? ui.segmentActive : ui.segmentInactive}` }, opt.label));
+                    })),
+                    React.createElement("span", { className: `text-[11px] px-2.5 py-1 rounded-full font-semibold tabular-nums whitespace-nowrap ${comparisonBadgeClass}` },
+                        trendComparisonTitle,
+                        ' ',
+                        formatComparisonPercentLabel(trendComparisonPercent))),
+                (() => {
+                    const svgWidth = 320;
+                    const svgHeight = 166;
+                    const padTop = 24;
+                    const padBottom = 26;
+                    const padLeft = 8;
+                    const padRight = 8;
+                    const plotWidth = svgWidth - padLeft - padRight;
+                    const plotHeight = svgHeight - padTop - padBottom;
+                    const baselineY = padTop + plotHeight;
+                    const midY = padTop + plotHeight / 2;
+                    const slotCount = Math.max(trendBars.length, 1);
+                    const slotWidth = plotWidth / slotCount;
+                    const barWidth = Math.min(28, Math.max(16, slotWidth * 0.54));
+                    const peakIndex = maxTrendDistance > 0
+                        ? trendBars.findIndex((b) => b.distanceMeters === maxTrendDistance)
+                        : -1;
+                    const latestIndex = trendBars.length - 1;
+                    return (React.createElement("div", { className: `p-2.5 rounded-2xl ${ui.subCard}` },
+                        React.createElement("svg", { viewBox: `0 0 ${svgWidth} ${svgHeight}`, className: "w-full h-auto block", role: "img", "aria-label": trendGranularity === 'weekly'
+                                ? '直近8週間の散歩距離バーグラフ'
+                                : '直近6ヶ月の散歩距離バーグラフ', "data-trend-granularity": trendGranularity },
+                            React.createElement("text", { x: padLeft, y: 13, fontSize: "10", fill: ui.svgAxisText, textAnchor: "start" }, maxTrendDistance > 0
+                                ? `最大 ${formatDistanceLabel(maxTrendDistance)}`
+                                : '記録なし'),
+                            React.createElement("line", { x1: padLeft, y1: padTop, x2: svgWidth - padRight, y2: padTop, stroke: ui.svgGridStroke, strokeWidth: "1", strokeDasharray: "3 3" }),
+                            React.createElement("line", { x1: padLeft, y1: midY, x2: svgWidth - padRight, y2: midY, stroke: ui.svgGridStroke, strokeWidth: "1", strokeDasharray: "3 3" }),
+                            React.createElement("line", { x1: padLeft, y1: baselineY, x2: svgWidth - padRight, y2: baselineY, stroke: ui.svgBaselineStroke, strokeWidth: "1.2" }),
+                            trendBars.map((item, idx) => {
+                                const distance = Number.isFinite(item.distanceMeters)
+                                    ? Math.max(0, item.distanceMeters)
+                                    : 0;
+                                const rawBarHeight = maxTrendDistance > 0 && distance > 0
+                                    ? (distance / maxTrendDistance) * plotHeight
+                                    : 0;
+                                const barHeight = distance > 0 ? Math.max(4, rawBarHeight) : 2;
+                                const x = padLeft + idx * slotWidth + (slotWidth - barWidth) / 2;
+                                const y = baselineY - barHeight;
+                                const centerX = padLeft + idx * slotWidth + slotWidth / 2;
+                                const isLatest = idx === latestIndex;
+                                const barFill = distance <= 0
+                                    ? ui.svgBarZero
+                                    : isLatest
+                                        ? ui.svgBarLatest
+                                        : ui.svgBarDefault;
+                                const showValueLabel = distance > 0 && (idx === peakIndex || idx === latestIndex);
+                                const labelAnchor = idx === 0
+                                    ? 'start'
+                                    : idx === latestIndex
+                                        ? 'end'
+                                        : 'middle';
+                                const labelX = idx === 0
+                                    ? Math.max(padLeft, x)
+                                    : idx === latestIndex
+                                        ? Math.min(svgWidth - padRight, x + barWidth)
+                                        : centerX;
+                                return (React.createElement("g", { key: item.key },
+                                    React.createElement("title", null, `${item.label}: ${formatDistanceLabel(distance)}（${item.walkCount}回）`),
+                                    React.createElement("rect", { "data-trend-bar": "true", x: Number(x.toFixed(1)), y: Number(y.toFixed(1)), width: Number(barWidth.toFixed(1)), height: Number(barHeight.toFixed(1)), rx: distance > 0 ? 4 : 1, fill: barFill }),
+                                    showValueLabel && (React.createElement("text", { x: Number(labelX.toFixed(1)), y: Number(Math.max(18, y - 4).toFixed(1)), fontSize: "9.5", fontWeight: "600", fill: ui.svgValueText, textAnchor: labelAnchor }, formatDistanceLabel(distance))),
+                                    React.createElement("text", { x: Number(centerX.toFixed(1)), y: svgHeight - 7, fontSize: trendGranularity === 'weekly' ? '9.5' : '10.5', fontWeight: isLatest ? '700' : '500', fill: isLatest ? ui.svgValueText : ui.svgAxisText, textAnchor: "middle" }, item.label)));
+                            })),
+                        latestTrendBar && (React.createElement("div", { className: `mt-1.5 pt-1.5 border-t flex items-center justify-between text-[11px] ${ui.divider} ${ui.textSecondary}` },
+                            React.createElement("span", null,
+                                trendGranularity === 'weekly' ? '今週' : '今月',
+                                "\uFF08",
+                                latestTrendBar.label,
+                                "\uFF09"),
+                            React.createElement("span", { className: `font-bold tabular-nums ${ui.textPrimary}` },
+                                formatDistanceLabel(latestTrendBar.distanceMeters),
+                                "\uFF08",
+                                latestTrendBar.walkCount.toLocaleString('ja-JP'),
+                                "\u56DE\uFF09")))));
+                })()),
+            React.createElement("div", { className: `p-4 rounded-3xl flex flex-col gap-3.5 ${ui.card}` },
+                React.createElement("div", { className: "flex items-center justify-between gap-2" },
+                    React.createElement("h3", { className: `text-sm font-bold flex items-center gap-1.5 ${ui.textPrimary}` },
+                        React.createElement("span", null, "\uD83D\uDD52"),
+                        React.createElement("span", null, "\u304A\u3055\u3093\u307D\u306E\u30EA\u30BA\u30E0")),
+                    React.createElement("span", { className: `text-[10px] ${ui.textMuted}` }, PERIOD_OPTIONS.find((opt) => opt.value === period)?.label)),
+                React.createElement("div", { className: "flex flex-col gap-2" },
+                    React.createElement("div", { className: "flex items-center justify-between gap-2" },
+                        React.createElement("span", { className: `text-xs font-bold ${ui.textSecondary}` }, "\u6642\u9593\u5E2F\u306E\u5206\u5E03"),
+                        topTimeSlotSummary && (React.createElement("span", { className: `text-[10px] px-2 py-0.5 rounded-full font-bold ${ui.patternTopBadge}` },
+                            "\u6700\u591A: ",
+                            topTimeSlotSummary))),
+                    React.createElement("div", { className: "flex flex-col gap-1.5" }, patterns.timeSlots.map((slot) => {
+                        const isTop = maxTimeSlotCount > 0 && slot.count === maxTimeSlotCount;
+                        const barWidthPercent = maxTimeSlotCount > 0 ? (slot.count / maxTimeSlotCount) * 100 : 0;
+                        return (React.createElement("div", { key: slot.id, "data-pattern-timeslot": slot.id, "data-pattern-top": isTop ? 'true' : 'false', className: `flex items-center gap-2 px-2.5 py-1.5 rounded-xl text-xs ${isTop ? ui.patternTopRow : ui.subCard}` },
+                            React.createElement("div", { className: "w-[92px] shrink-0 flex items-center gap-1 whitespace-nowrap" },
+                                React.createElement("span", { className: `font-bold ${isTop ? ui.textPrimary : ui.textSecondary}` }, isTop ? `★ ${slot.label}` : slot.label),
+                                React.createElement("span", { className: `text-[10px] ${ui.textMuted}` }, slot.rangeLabel)),
+                            React.createElement("div", { className: `flex-1 min-w-[44px] h-2.5 rounded-full overflow-hidden ${ui.barTrack}` },
+                                React.createElement("div", { className: `h-full rounded-full transition-all duration-300 ${isTop ? ui.patternTopBar : ui.patternNormalBar}`, style: {
+                                        width: `${slot.count > 0 ? Math.max(6, Math.min(100, barWidthPercent)) : 0}%`,
+                                    } })),
+                            React.createElement("span", { className: `min-w-[76px] shrink-0 text-right tabular-nums text-[11px] whitespace-nowrap ${isTop ? `font-bold ${ui.textPrimary}` : ui.textSecondary}` },
+                                slot.count.toLocaleString('ja-JP'),
+                                "\u56DE (",
+                                formatPercentLabel(slot.percent),
+                                ")")));
+                    }))),
+                React.createElement("div", { className: `pt-3 border-t flex flex-col gap-2 ${ui.divider}` },
+                    React.createElement("div", { className: "flex items-center justify-between gap-2" },
+                        React.createElement("span", { className: `text-xs font-bold ${ui.textSecondary}` }, "\u66DC\u65E5\u3054\u3068\u306E\u56DE\u6570"),
+                        topDaySummary && (React.createElement("span", { className: `text-[10px] px-2 py-0.5 rounded-full font-bold ${ui.patternTopBadge}` },
+                            "\u6700\u591A: ",
+                            topDaySummary))),
+                    React.createElement("div", { className: "flex flex-col gap-1.5" }, patterns.dayOfWeek.map((day) => {
+                        const isTop = maxDayCount > 0 && day.count === maxDayCount;
+                        const barWidthPercent = maxDayCount > 0 ? (day.count / maxDayCount) * 100 : 0;
+                        return (React.createElement("div", { key: day.dayIndex, "data-pattern-day": day.label, "data-pattern-top": isTop ? 'true' : 'false', className: `flex items-center gap-2 px-2.5 py-1.5 rounded-xl text-xs ${isTop ? ui.patternTopRow : ui.subCard}` },
+                            React.createElement("div", { className: "w-12 shrink-0 flex items-center gap-1" },
+                                React.createElement("span", { className: `font-bold ${isTop ? ui.textPrimary : ui.textSecondary}` }, day.label),
+                                isTop && (React.createElement("span", { className: `text-[9px] px-1 py-0.5 leading-none rounded font-bold ${ui.patternTopBadge}` }, "\u6700\u591A"))),
+                            React.createElement("div", { className: `flex-1 min-w-0 h-2.5 rounded-full overflow-hidden ${ui.barTrack}` },
+                                React.createElement("div", { className: `h-full rounded-full transition-all duration-300 ${isTop ? ui.patternTopBar : ui.patternNormalBar}`, style: {
+                                        width: `${day.count > 0 ? Math.max(6, Math.min(100, barWidthPercent)) : 0}%`,
+                                    } })),
+                            React.createElement("span", { className: `w-12 shrink-0 text-right tabular-nums text-[11px] ${isTop ? `font-bold ${ui.textPrimary}` : ui.textSecondary}` },
+                                day.count.toLocaleString('ja-JP'),
+                                " \u56DE")));
+                    })))),
+            React.createElement("div", { className: `p-4 rounded-3xl flex flex-col gap-3 ${ui.card}` },
+                React.createElement("div", { className: "flex items-center justify-between gap-2" },
+                    React.createElement("h3", { className: `text-sm font-bold flex items-center gap-1.5 ${ui.textPrimary}` },
+                        React.createElement("span", null, "\uD83D\uDCA9"),
+                        React.createElement("span", null, "\u3046\u3093\u3061\u306E\u30B3\u30F3\u30C7\u30A3\u30B7\u30E7\u30F3")),
+                    React.createElement("span", { className: `text-[11px] tabular-nums ${ui.textMuted}` },
+                        "\u5408\u8A08 ",
+                        poop.totalCount.toLocaleString('ja-JP'),
+                        "\u56DE")),
+                poop.totalCount === 0 ? (React.createElement("div", { className: `p-3 rounded-2xl text-center text-xs ${ui.subCard} ${ui.textSecondary}` }, "\u3053\u306E\u671F\u9593\u306E\u3046\u3093\u3061\u8A18\u9332\u306F\u3042\u308A\u307E\u305B\u3093")) : (React.createElement(React.Fragment, null,
+                    React.createElement("div", { className: `w-full h-3.5 rounded-full overflow-hidden flex ${ui.barTrack}`, role: "img", "aria-label": "\u3046\u3093\u3061\u72B6\u614B\u306E\u5272\u5408\u30D0\u30FC" }, poop.items
+                        .filter((item) => item.count > 0)
+                        .map((item) => {
+                        const stylePair = POOP_SEGMENT_STYLE[item.condition];
+                        const colorClass = darkMode ? stylePair.dark : stylePair.light;
+                        return (React.createElement("div", { key: item.condition, "data-poop-segment": item.condition, className: `h-full transition-all duration-300 ${colorClass}`, style: { width: `${Math.max(0, Math.min(100, item.percent))}%` }, title: `${item.label}: ${item.count}回 (${formatPercentLabel(item.percent)})` }));
+                    })),
+                    React.createElement("div", { className: "grid grid-cols-2 gap-2 text-xs" }, poop.items.map((item) => {
+                        const stylePair = POOP_SEGMENT_STYLE[item.condition];
+                        const dotColorClass = darkMode ? stylePair.dark : stylePair.light;
+                        return (React.createElement("div", { key: item.condition, className: `px-2.5 py-2 rounded-2xl flex items-center justify-between gap-1.5 ${ui.subCard}` },
+                            React.createElement("span", { className: `flex items-center gap-1.5 min-w-0 truncate ${ui.textSecondary}` },
+                                React.createElement("span", { className: `w-2.5 h-2.5 rounded-full shrink-0 ${dotColorClass}` }),
+                                React.createElement("span", { className: "truncate font-medium" }, item.label)),
+                            React.createElement("span", { className: `text-[11px] font-bold tabular-nums whitespace-nowrap shrink-0 ${ui.textPrimary}` },
+                                item.count.toLocaleString('ja-JP'),
+                                "\u56DE (",
+                                formatPercentLabel(item.percent),
+                                ")")));
+                    }))))),
+            React.createElement("div", { className: `p-4 rounded-3xl flex flex-col gap-3 ${ui.card}` },
+                React.createElement("div", { className: "flex items-center justify-between gap-2" },
+                    React.createElement("h3", { className: `text-sm font-bold flex items-center gap-1.5 ${ui.textPrimary}` },
+                        React.createElement("span", null, "\uD83C\uDFC1"),
+                        React.createElement("span", null, "\u304D\u3087\u308A\u30DE\u30A4\u30EB\u30B9\u30C8\u30FC\u30F3")),
+                    React.createElement("span", { className: `text-[10px] ${ui.textMuted}` },
+                        "1\u5468 = ",
+                        formatDistanceLabel(milestone.unitDistanceMeters))),
+                React.createElement("div", { className: `p-3 rounded-2xl flex items-center justify-between gap-2 ${ui.heroTile}` },
+                    React.createElement("div", null,
+                        React.createElement("span", { className: "text-[11px] font-medium block" },
+                            milestone.unitName,
+                            "\u63DB\u7B97"),
+                        React.createElement("p", { className: "text-xl font-bold tabular-nums mt-0.5" },
+                            milestone.completedUnits.toLocaleString('ja-JP'),
+                            " \u56DE\u5206\u9054\u6210")),
+                    React.createElement("span", { className: `text-[11px] px-2.5 py-1 rounded-full font-medium tabular-nums whitespace-nowrap ${ui.subCard} ${ui.textSecondary}` },
+                        "\u7D2F\u8A08 ",
+                        formatDistanceLabel(summary.totalDistanceMeters))),
+                React.createElement("div", { className: `p-3 rounded-2xl flex flex-col gap-2 ${ui.subCard}` },
+                    React.createElement("div", { className: "flex items-center justify-between gap-2 text-xs" },
+                        React.createElement("span", { className: `font-medium ${ui.textSecondary}` },
+                            "\u6B21\u306E",
+                            milestone.unitName,
+                            "\u307E\u3067"),
+                        React.createElement("span", { className: `font-bold tabular-nums ${ui.textPrimary}` },
+                            "\u3042\u3068 ",
+                            formatDistanceLabel(milestone.remainingMetersToNext))),
+                    React.createElement("div", { className: `w-full h-3 rounded-full overflow-hidden ${ui.barTrack}`, role: "progressbar", "aria-valuenow": Number(milestoneProgressPercent.toFixed(1)), "aria-valuemin": 0, "aria-valuemax": 100, "aria-label": "\u6B21\u306E\u30DE\u30A4\u30EB\u30B9\u30C8\u30FC\u30F3\u307E\u3067\u306E\u9032\u6357", "data-milestone-progress": milestoneProgressPercent.toFixed(1) },
+                        React.createElement("div", { className: `h-full rounded-full transition-all duration-300 ${ui.barFill}`, style: { width: `${milestoneProgressPercent.toFixed(1)}%` } })),
+                    React.createElement("div", { className: `flex items-center justify-between text-[11px] ${ui.textMuted}` },
+                        React.createElement("span", null, "\u73FE\u5728\u306E\u5468\u56DE\u9032\u6357"),
+                        React.createElement("span", { className: `font-bold tabular-nums ${ui.textPrimary}` }, formatPercentLabel(milestoneProgressPercent)))))))));
 }
 
 
