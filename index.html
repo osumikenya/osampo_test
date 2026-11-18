@@ -41,14 +41,17 @@
       overscroll-behavior-y: none;
     }
     input[type="date"] {
-      -webkit-appearance: none;
-      appearance: none;
-      box-sizing: border-box;
-      max-width: 100%;
-      min-width: 0;
+      -webkit-appearance: none !important;
+      appearance: none !important;
+      box-sizing: border-box !important;
+      width: 100% !important;
+      max-width: 100% !important;
+      min-width: 0 !important;
+      margin: 0 !important;
     }
     input[type="date"]::-webkit-date-and-time-value {
-      text-align: left;
+      text-align: left !important;
+      margin: 0 !important;
     }
   </style>
 </head>
@@ -3413,7 +3416,7 @@ function KunKatsuApp() {
             React.createElement("h2", { className: "text-base font-bold flex items-center gap-2" },
                 React.createElement("span", null, "\u2699\uFE0F"),
                 " \u8A2D\u5B9A\u30FB\u30D7\u30E9\u30A4\u30D0\u30B7\u30FC\u4FDD\u8B77"),
-            React.createElement("div", { className: `p-3.5 rounded-2xl border flex flex-col gap-2.5 ${theme.card}` },
+            React.createElement("div", { className: `p-3.5 rounded-2xl border flex flex-col gap-2.5 min-w-0 overflow-hidden ${theme.card}` },
                 React.createElement("h3", { className: `font-bold text-sm ${theme.textPrimary}` }, "\uD83D\uDC15 \u611B\u72AC\u30FB\u98FC\u3044\u4E3B\u30D7\u30ED\u30D5\u30A3\u30FC\u30EB"),
                 React.createElement("p", { className: `text-[11px] leading-relaxed ${theme.textSecondary}` }, "\u611B\u72AC\u306E\u540D\u524D\u306F\u8A18\u9332\u30AB\u30FC\u30C9\uFF08\u30B7\u30A7\u30A2\u753B\u50CF\uFF09\u306B\u3001\u98FC\u3044\u4E3B\u306E\u4F53\u91CD\u306F\u6D88\u8CBB\u30AB\u30ED\u30EA\u30FC\u8A08\u7B97\u306B\u4F7F\u308F\u308C\u307E\u3059\u3002"),
                 React.createElement("div", { className: "flex flex-col gap-1" },
@@ -3433,7 +3436,8 @@ function KunKatsuApp() {
                         React.createElement("span", { className: `text-[10px] ${theme.textMuted}` }, "20\u301C200 kg"))),
                 React.createElement("div", { className: "flex flex-col gap-1 min-w-0" },
                     React.createElement("label", { htmlFor: "dog-birthdate-input", className: `font-medium ${theme.textSecondary}` }, "\u304A\u8A95\u751F\u65E5"),
-                    React.createElement("input", { id: "dog-birthdate-input", type: "date", value: profile.birthDate, onChange: (e) => setProfile({ ...profile, birthDate: e.target.value }), style: { colorScheme: darkMode ? 'dark' : 'light' }, className: `block w-full max-w-full min-w-0 box-border appearance-none text-left min-h-[34px] px-3 py-2 rounded-xl text-xs ${theme.input}` }))),
+                    React.createElement("div", { id: "dog-birthdate-box", className: `w-full max-w-full min-w-0 box-border overflow-hidden rounded-xl ${theme.input}` },
+                        React.createElement("input", { id: "dog-birthdate-input", type: "date", value: profile.birthDate, onChange: (e) => setProfile({ ...profile, birthDate: e.target.value }), style: { colorScheme: darkMode ? 'dark' : 'light' }, className: "block w-full max-w-full min-w-0 box-border appearance-none bg-transparent border-0 outline-none text-left min-h-[34px] px-3 py-2 text-xs text-inherit" })))),
             React.createElement("div", { className: `p-3.5 rounded-2xl border flex flex-col gap-2.5 ${theme.card}` },
                 React.createElement("h3", { className: `font-bold text-sm ${theme.textPrimary}` }, "\uD83C\uDFE0 \u304A\u3046\u3061\u30D0\u30EC\u9632\u6B62\uFF08\u81EA\u5B85\u306E\u307E\u308F\u308A\u3092\u304B\u304F\u3059\uFF09"),
                 React.createElement("p", { className: `text-[11px] leading-relaxed ${theme.textSecondary}` }, "\u81EA\u5B85\u304B\u3089\u6307\u5B9A\u3057\u305F\u534A\u5F84\u5185\u306EGPS\u8A18\u9332\u3092\u81EA\u52D5\u3067\u6D88\u53BB\u3057\u307E\u3059\u3002 \u767B\u9332\u6642\u306B\u4E2D\u5FC3\u4F4D\u7F6E\u307830\u301C70m\u306E\u30E9\u30F3\u30C0\u30E0\u30AA\u30D5\u30BB\u30C3\u30C8\u304C\u9069\u7528\u3055\u308C\u308B\u305F\u3081\u3001\u5186\u306E\u4E2D\u5FC3\u304B\u3089\u81EA\u5B85\u3092\u7279\u5B9A\u3055\u308C\u308B\u5FC3\u914D\u3082\u3042\u308A\u307E\u305B\u3093\u3002"),
