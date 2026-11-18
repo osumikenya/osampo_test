@@ -237,6 +237,35 @@ async function saveWalkSession(walk) {
     });
 }
 /**
+ * 指定した散歩記録を1件削除する
+ */
+async function deleteWalkSession(walkId) {
+    const db = await openDB();
+    return new Promise((resolve, reject) => {
+        const tx = db.transaction(STORE_WALKS, 'readwrite');
+        tx.objectStore(STORE_WALKS).delete(walkId);
+        tx.oncomplete = () => resolve();
+        tx.onerror = () => reject(tx.error);
+    });
+}
+/**
+ * 指定した複数の散歩記録を単一トランザクションで一括削除する
+ */
+async function deleteWalkSessions(walkIds) {
+    if (walkIds.length === 0)
+        return;
+    const db = await openDB();
+    return new Promise((resolve, reject) => {
+        const tx = db.transaction(STORE_WALKS, 'readwrite');
+        const store = tx.objectStore(STORE_WALKS);
+        walkIds.forEach((id) => {
+            store.delete(id);
+        });
+        tx.oncomplete = () => resolve();
+        tx.onerror = () => reject(tx.error);
+    });
+}
+/**
  * 室内でもすぐにヒートマップ描画・エンジン比較を試せるサンプルデータ生成
  */
 async function seedDemoWalkData(baseLat, baseLng) {
@@ -388,9 +417,16 @@ function generateShareCardBlob(walk, dogName = '愛犬') {
                 shareCardDrawPaw(ctx, p.cx, p.cy, p.size, p.rot, p.color);
             });
             // 2. ヘッダー（丸ゴシック見出し＋おうちバレ防止バッジ）
+            const safeDogName = dogName.trim() || '愛犬';
+            const titleText = `🐕 ${safeDogName}のおさんぽのきろく`;
+            let titleFontSize = 34;
             ctx.fillStyle = '#292524';
-            ctx.font = `bold 34px ${SHARE_CARD_FONT}`;
-            ctx.fillText(`🐕 ${dogName}のおさんぽのきろく`, 48, 70);
+            ctx.font = `bold ${titleFontSize}px ${SHARE_CARD_FONT}`;
+            while (titleFontSize > 26 && ctx.measureText(titleText).width > 704) {
+                titleFontSize -= 2;
+                ctx.font = `bold ${titleFontSize}px ${SHARE_CARD_FONT}`;
+            }
+            ctx.fillText(titleText, 48, 70, 704);
             const dateStr = new Date(walk.startTime).toLocaleDateString('ja-JP');
             ctx.fillStyle = '#78716C';
             ctx.font = `bold 20px ${SHARE_CARD_FONT}`;
@@ -591,6 +627,18 @@ function generateShareCardBlob(walk, dogName = '愛犬') {
                     ctx.fillText(` ${st.unit}`, bx + 22 + numWidth, by + 86);
                 }
             });
+            // 4.5 ひとことメモ（入力時のみ4指標パネルとフッターの間に1行表示）
+            const normalizedMemo = (walk.memo || '').replace(/\s+/g, ' ').trim();
+            if (normalizedMemo) {
+                const memoChars = Array.from(normalizedMemo);
+                const truncatedMemo = memoChars.length > 32 ? `${memoChars.slice(0, 31).join('')}…` : normalizedMemo;
+                ctx.save();
+                ctx.textAlign = 'center';
+                ctx.fillStyle = '#57534E';
+                ctx.font = `bold 15px ${SHARE_CARD_FONT}`;
+                ctx.fillText(`📝 ${truncatedMemo}`, 400, 902, 704);
+                ctx.restore();
+            }
             // 5. フッター（ブランドロゴ・やさしいフッター表示）
             ctx.save();
             ctx.textAlign = 'center';
@@ -1739,7 +1787,7 @@ function formatComparisonPercentLabel(percent) {
     const sign = percent > 0 ? '+' : '';
     return `${sign}${percent.toFixed(1)}%`;
 }
-function StatsDashboard({ walks, darkMode, initialPeriod = 'all', initialTrendGranularity = 'weekly', }) {
+function StatsDashboard({ walks, darkMode, initialPeriod = 'all', initialTrendGranularity = 'weekly', onSelectWalk, }) {
     const [period, setPeriod] = useState(initialPeriod);
     const [trendGranularity, setTrendGranularity] = useState(initialTrendGranularity);
     const stats = useMemo(() => calculateWalkStats(walks, period), [walks, period]);
@@ -1978,13 +2026,29 @@ function StatsDashboard({ walks, darkMode, initialPeriod = 'all', initialTrendGr
                             : '--',
                         tileClass: ui.statSniffTile,
                     },
-                ].map((item) => (React.createElement("div", { key: item.key, className: `p-3 rounded-2xl flex items-center justify-between gap-2 ${item.tileClass}` },
-                    React.createElement("div", { className: "flex items-center gap-2 min-w-0" },
-                        React.createElement("span", { className: "text-base leading-none shrink-0" }, item.icon),
-                        React.createElement("span", { className: "font-medium truncate" }, item.label)),
-                    React.createElement("div", { className: "text-right shrink-0" },
-                        React.createElement("p", { className: "text-sm font-bold tabular-nums leading-tight" }, item.valueText),
-                        React.createElement("span", { className: `text-[10px] tabular-nums block mt-0.5 ${ui.textMuted}` }, item.record ? item.record.dateLabel : '記録なし'))))))),
+                ].map((item) => {
+                    const record = item.record;
+                    const canSelect = Boolean(record && onSelectWalk);
+                    return (React.createElement("button", { key: item.key, type: "button", disabled: !canSelect, "aria-label": canSelect && record
+                            ? `${item.label}（${item.valueText}・${record.dateLabel}）のふりかえりルートを見る`
+                            : undefined, onClick: () => {
+                            if (record && onSelectWalk) {
+                                onSelectWalk(record.walkId);
+                            }
+                        }, className: `w-full text-left p-3 rounded-2xl flex items-center justify-between gap-2 transition-all ${item.tileClass} ${canSelect
+                            ? 'cursor-pointer hover:opacity-90 active:scale-[0.99] focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-[#F0653A]'
+                            : record
+                                ? 'cursor-default'
+                                : 'cursor-default opacity-75'}` },
+                        React.createElement("div", { className: "flex items-center gap-2 min-w-0" },
+                            React.createElement("span", { className: "text-base leading-none shrink-0" }, item.icon),
+                            React.createElement("div", { className: "min-w-0" },
+                                React.createElement("span", { className: "font-medium truncate block" }, item.label),
+                                canSelect && (React.createElement("span", { className: `text-[10px] font-semibold block mt-0.5 ${darkMode ? 'text-[#D6CFC5]' : 'text-stone-600'}` }, "\uD83D\uDCD6 \u30EB\u30FC\u30C8\u3092\u898B\u308B \uFF1E")))),
+                        React.createElement("div", { className: "text-right shrink-0" },
+                            React.createElement("p", { className: "text-sm font-bold tabular-nums leading-tight" }, item.valueText),
+                            React.createElement("span", { className: `text-[10px] tabular-nums block mt-0.5 ${ui.textMuted}` }, record ? record.dateLabel : '記録なし'))));
+                }))),
             React.createElement("div", { className: `p-4 rounded-3xl flex flex-col gap-3 ${ui.card}` },
                 React.createElement("div", { className: "flex items-center justify-between gap-2" },
                     React.createElement("h3", { className: `text-sm font-bold flex items-center gap-1.5 ${ui.textPrimary}` },
@@ -2332,18 +2396,24 @@ function KunKatsuApp() {
     const [undoTargetId, setUndoTargetId] = useState(null);
     const [showPoopSelectorForId, setShowPoopSelectorForId] = useState(null);
     const [stopHoldProgress, setStopHoldProgress] = useState(0);
-    const [latestWalk, setLatestWalk] = useState(null);
+    const [selectedWalkId, setSelectedWalkId] = useState(null);
     const [allWalks, setAllWalks] = useState([]);
+    const [memoEdit, setMemoEdit] = useState(null);
+    const [deleteConfirmWalkId, setDeleteConfirmWalkId] = useState(null);
+    const [bulkDeleteConfirm, setBulkDeleteConfirm] = useState(false);
     const [heatmapLayer, setHeatmapLayer] = useState('sniff');
     const [periodFilter, setPeriodFilter] = useState('all');
+    const [dogWeightDraft, setDogWeightDraft] = useState('28');
+    const [ownerWeightDraft, setOwnerWeightDraft] = useState('65');
+    const [geofenceRadiusDraft, setGeofenceRadiusDraft] = useState('200');
     const [toastMessage, setToastMessage] = useState(null);
     const toastTimeoutRef = useRef(null);
     const [lockFlashColor, setLockFlashColor] = useState(null);
     const flashTimeoutRef = useRef(null);
     const iosHapticLabelRef = useRef(null);
-    const [preparedShareFile, setPreparedShareFile] = useState(null);
-    const [preparedShareBlob, setPreparedShareBlob] = useState(null);
-    const [isGeneratingShareImage, setIsGeneratingShareImage] = useState(false);
+    const [preparedShare, setPreparedShare] = useState(null);
+    const [shareGenStatus, setShareGenStatus] = useState(null);
+    const [isManualSharing, setIsManualSharing] = useState(false);
     const [showShareModalUrl, setShowShareModalUrl] = useState(null);
     const [isWakeLocked, setIsWakeLocked] = useState(false);
     const [lastGpsReceivedAt, setLastGpsReceivedAt] = useState(null);
@@ -2353,6 +2423,14 @@ function KunKatsuApp() {
     const [totalInterruptedSec, setTotalInterruptedSec] = useState(0);
     const hiddenStartTimestampRef = useRef(null);
     const totalInterruptedSecRef = useRef(0);
+    const clampProfileNumber = (raw, min, max, fallback, decimals = 1) => {
+        const trimmed = raw.trim();
+        const parsed = Number(trimmed);
+        const base = trimmed !== '' && Number.isFinite(parsed) ? parsed : fallback;
+        const clamped = Math.min(max, Math.max(min, base));
+        const factor = 10 ** decimals;
+        return Math.round(clamped * factor) / factor;
+    };
     const showToast = (msg) => {
         if (toastTimeoutRef.current)
             clearTimeout(toastTimeoutRef.current);
@@ -2361,6 +2439,22 @@ function KunKatsuApp() {
             setToastMessage(null);
         }, 3000);
     };
+    const resetSummaryConfirmations = () => {
+        setDeleteConfirmWalkId(null);
+        setBulkDeleteConfirm(false);
+    };
+    const selectWalk = (walkId) => {
+        setSelectedWalkId(walkId);
+        resetSummaryConfirmations();
+    };
+    const switchTab = (nextTab) => {
+        setActiveTab(nextTab);
+        resetSummaryConfirmations();
+    };
+    const profileRef = useRef(null);
+    useEffect(() => {
+        profileRef.current = profile;
+    }, [profile]);
     const slowStartTimestampRef = useRef(null);
     const lastPointRef = useRef(null);
     const holdIntervalRef = useRef(null);
@@ -2372,10 +2466,13 @@ function KunKatsuApp() {
         (async () => {
             const loadedProfile = await getDogProfile();
             setProfile(loadedProfile);
+            setDogWeightDraft(String(loadedProfile.weightKg));
+            setOwnerWeightDraft(String(loadedProfile.ownerWeightKg));
+            setGeofenceRadiusDraft(String(loadedProfile.geofenceRadiusMeters));
             const walks = await getAllWalks();
             setAllWalks(walks);
             if (walks.length > 0)
-                setLatestWalk(walks[0]);
+                setSelectedWalkId(walks[0].id);
             if ('geolocation' in navigator) {
                 navigator.geolocation.getCurrentPosition((pos) => {
                     const rawLat = pos.coords.latitude;
@@ -2705,10 +2802,10 @@ function KunKatsuApp() {
             backgroundInterruptedSec: totalInterruptedSecRef.current,
         };
         await saveWalkSession(completedWalk);
-        setLatestWalk(completedWalk);
         const walks = await getAllWalks();
         setAllWalks(walks);
-        setActiveTab('summary');
+        selectWalk(completedWalk.id);
+        switchTab('summary');
     };
     // 散歩終了長押しハンドラ
     const handleStopHoldStart = () => {
@@ -2739,6 +2836,84 @@ function KunKatsuApp() {
         const secs = totalSec % 60;
         return `${mins.toString().padStart(2, '0')}:${secs.toString().padStart(2, '0')}`;
     };
+    const formatSummaryDateTime = (timestamp) => {
+        const d = new Date(timestamp);
+        const year = d.getFullYear();
+        const month = String(d.getMonth() + 1).padStart(2, '0');
+        const day = String(d.getDate()).padStart(2, '0');
+        const hour = String(d.getHours()).padStart(2, '0');
+        const minute = String(d.getMinutes()).padStart(2, '0');
+        return `${year}/${month}/${day} ${hour}:${minute}`;
+    };
+    // ふりかえり表示中の散歩記録と統計除外対象ID一覧
+    const currentWalk = useMemo(() => allWalks.find((w) => w.id === selectedWalkId) ?? allWalks[0] ?? null, [allWalks, selectedWalkId]);
+    const currentWalkIndex = useMemo(() => {
+        if (!currentWalk)
+            return -1;
+        return allWalks.findIndex((w) => w.id === currentWalk.id);
+    }, [allWalks, currentWalk]);
+    const excludedWalkIds = useMemo(() => allWalks.filter((w) => getWalkExclusionReason(w) !== null).map((w) => w.id), [allWalks]);
+    // 表示中のメモ編集値（walkIdが切り替わると自動的に対象記録のメモに戻る）
+    const memoDraft = currentWalk && memoEdit?.walkId === currentWalk.id
+        ? memoEdit.text
+        : (currentWalk?.memo ?? '');
+    const buildShareCacheKey = (walk, dogName) => `${walk.id}:${walk.memo}:${walk.safePhotoDataUrl ?? ''}:${dogName}`;
+    const currentDogName = profile?.name || '愛犬';
+    const currentShareCacheKey = currentWalk
+        ? buildShareCacheKey(currentWalk, currentDogName)
+        : null;
+    const isGeneratingShareImage = isManualSharing ||
+        Boolean(activeTab === 'summary' &&
+            currentShareCacheKey &&
+            shareGenStatus?.cacheKey !== currentShareCacheKey);
+    const saveWalkMemo = async (walk, nextRaw, notifyUnchanged) => {
+        const nextMemo = nextRaw.slice(0, 200);
+        if (nextMemo === walk.memo) {
+            setMemoEdit((prev) => (prev?.walkId === walk.id ? null : prev));
+            if (notifyUnchanged)
+                showToast('📝 メモは保存済みです');
+            return;
+        }
+        const updated = { ...walk, memo: nextMemo };
+        try {
+            await saveWalkSession(updated);
+            setAllWalks((prev) => prev.map((w) => (w.id === walk.id ? { ...w, memo: nextMemo } : w)));
+            setMemoEdit((prev) => (prev?.walkId === walk.id ? null : prev));
+            showToast('📝 おさんぽメモを保存しました');
+        }
+        catch {
+            showToast('メモの保存に失敗しました');
+        }
+    };
+    const handleDeleteWalk = async (walkId) => {
+        const idx = allWalks.findIndex((w) => w.id === walkId);
+        await deleteWalkSession(walkId);
+        const walks = await getAllWalks();
+        setAllWalks(walks);
+        if (walks.length === 0) {
+            selectWalk(null);
+        }
+        else {
+            const nextIdx = Math.min(Math.max(idx, 0), walks.length - 1);
+            selectWalk(walks[nextIdx].id);
+        }
+        showToast('🗑️ おさんぽ記録を削除しました');
+    };
+    const handleBulkDeleteExcluded = async () => {
+        if (excludedWalkIds.length === 0)
+            return;
+        const deletedCount = excludedWalkIds.length;
+        await deleteWalkSessions(excludedWalkIds);
+        const walks = await getAllWalks();
+        setAllWalks(walks);
+        if (selectedWalkId && !walks.some((w) => w.id === selectedWalkId)) {
+            selectWalk(walks[0]?.id ?? null);
+        }
+        else {
+            resetSummaryConfirmations();
+        }
+        showToast(`🧹 短い・テスト記録 ${deletedCount}件を削除しました`);
+    };
     // 期間フィルタに基づくヒートマップ対象データの算出
     const filteredWalks = useMemo(() => {
         if (periodFilter === 'all')
@@ -2750,30 +2925,31 @@ function KunKatsuApp() {
     }, [allWalks, periodFilter]);
     // サマリー画面表示時のシェア画像事前生成（Web Share API の即時タップ発火用）
     useEffect(() => {
-        if (activeTab === 'summary' && latestWalk) {
+        if (activeTab === 'summary' && currentWalk && currentShareCacheKey) {
             let isMounted = true;
-            setIsGeneratingShareImage(true);
-            generateShareCardBlob(latestWalk, profile?.name || '愛犬')
+            const targetKey = currentShareCacheKey;
+            const targetWalk = currentWalk;
+            const targetDogName = currentDogName;
+            generateShareCardBlob(targetWalk, targetDogName)
                 .then((blob) => {
                 if (!isMounted)
                     return;
-                const dateStr = new Date(latestWalk.startTime).toISOString().slice(0, 10).replace(/-/g, '');
-                const filename = `kunkatsu_${dateStr}_${latestWalk.id.slice(-6)}.png`;
+                const dateStr = new Date(targetWalk.startTime).toISOString().slice(0, 10).replace(/-/g, '');
+                const filename = `kunkatsu_${dateStr}_${targetWalk.id.slice(-6)}.png`;
                 const file = new File([blob], filename, { type: 'image/png' });
-                setPreparedShareBlob(blob);
-                setPreparedShareFile(file);
-                setIsGeneratingShareImage(false);
+                setPreparedShare({ cacheKey: targetKey, blob, file });
+                setShareGenStatus({ cacheKey: targetKey, status: 'done' });
             })
                 .catch((err) => {
                 console.warn('Failed to pre-generate share card:', err);
                 if (isMounted)
-                    setIsGeneratingShareImage(false);
+                    setShareGenStatus({ cacheKey: targetKey, status: 'error' });
             });
             return () => {
                 isMounted = false;
             };
         }
-    }, [activeTab, latestWalk, profile?.name]);
+    }, [activeTab, currentWalk, currentShareCacheKey, currentDogName]);
     // 実測クン活スポットTop3の自動クラスタリング集計
     const topSniffSpots = useMemo(() => {
         const sniffs = filteredWalks.flatMap((w) => w.actionLogs.filter((l) => l.type === 'sniff_auto' || l.type === 'sniff_manual'));
@@ -2795,7 +2971,7 @@ function KunKatsuApp() {
     }, [filteredWalks]);
     // サマリー・ヒートマップ表示用の安全な中心座標（自宅マスク外の実測ルート重心を優先）
     const summaryCenter = useMemo(() => {
-        const pts = latestWalk?.routePoints || [];
+        const pts = currentWalk?.routePoints || [];
         if (pts.length > 0) {
             const sumLat = pts.reduce((acc, p) => acc + p.lat, 0);
             const sumLng = pts.reduce((acc, p) => acc + p.lng, 0);
@@ -2805,7 +2981,7 @@ function KunKatsuApp() {
             lat: profile?.homeLat ?? currentLat,
             lng: profile?.homeLng ?? currentLng,
         };
-    }, [latestWalk, profile, currentLat, currentLng]);
+    }, [currentWalk, profile, currentLat, currentLng]);
     const heatmapCenter = useMemo(() => {
         const pts = filteredWalks.flatMap((w) => w.routePoints);
         if (pts.length > 0) {
@@ -2820,25 +2996,28 @@ function KunKatsuApp() {
     }, [filteredWalks, profile, currentLat, currentLng]);
     // リザルト画像の保存・共有ハンドラ（Web Share API 即時発火 ＆ フォールバック）
     const handleShareOrSave = async (walk) => {
-        let file = preparedShareFile;
-        let blob = preparedShareBlob;
-        // 事前生成が未完了の場合はその場で生成
+        const dogName = profile?.name || '愛犬';
+        const expectedKey = buildShareCacheKey(walk, dogName);
+        const cached = preparedShare?.cacheKey === expectedKey ? preparedShare : null;
+        let file = cached?.file ?? null;
+        let blob = cached?.blob ?? null;
+        // 事前生成が未完了または別条件の場合はその場で生成
         if (!file || !blob) {
-            setIsGeneratingShareImage(true);
+            setIsManualSharing(true);
             try {
-                blob = await generateShareCardBlob(walk, profile?.name || '愛犬');
+                blob = await generateShareCardBlob(walk, dogName);
                 const dateStr = new Date(walk.startTime).toISOString().slice(0, 10).replace(/-/g, '');
                 const filename = `kunkatsu_${dateStr}_${walk.id.slice(-6)}.png`;
                 file = new File([blob], filename, { type: 'image/png' });
-                setPreparedShareBlob(blob);
-                setPreparedShareFile(file);
+                setPreparedShare({ cacheKey: expectedKey, blob, file });
+                setShareGenStatus({ cacheKey: expectedKey, status: 'done' });
             }
             catch (e) {
                 showToast('画像の生成に失敗しました');
-                setIsGeneratingShareImage(false);
+                setIsManualSharing(false);
                 return;
             }
-            setIsGeneratingShareImage(false);
+            setIsManualSharing(false);
         }
         const filename = file.name;
         // 1. Web Share API (iOS Safari / Android): 事前生成Fileがあるためタップ直後に即発火
@@ -2945,6 +3124,8 @@ function KunKatsuApp() {
                     React.createElement("span", null, "\uD83D\uDD12"),
                     " \u30DD\u30B1\u30C3\u30C8\u30ED\u30C3\u30AF")),
                 React.createElement("button", { onClick: () => setDarkMode(!darkMode), className: `p-2 rounded-full ${theme.themeToggleBtn} text-xs transition-colors`, title: "\u30C6\u30FC\u30DE\u5207\u66FF" }, darkMode ? '☀️' : '🌙'))),
+        !pocketLock && toastMessage && (React.createElement("div", { className: "fixed top-16 left-1/2 -translate-x-1/2 z-50 w-[calc(100%-2rem)] max-w-md pointer-events-none" },
+            React.createElement("div", { role: "status", "aria-live": "polite", className: `px-3.5 py-2.5 rounded-2xl text-center text-xs font-medium shadow-lg backdrop-blur animate-fade-in ${theme.toastWarn}` }, toastMessage))),
         activeTab === 'walk' && (React.createElement("section", { className: "p-4 flex flex-col gap-3" },
             React.createElement("div", { className: "grid grid-cols-3 gap-2" },
                 React.createElement("div", { className: `p-2.5 rounded-2xl text-center border ${theme.statTimeTile}` },
@@ -2969,7 +3150,6 @@ function KunKatsuApp() {
                     React.createElement("span", null, "\uD83D\uDC3E"),
                     React.createElement("span", null, "\u304A\u3055\u3093\u307D\u30B9\u30BF\u30FC\u30C8")),
                 React.createElement("button", { onClick: () => startWalk(true), className: `w-full py-2 rounded-xl text-xs active:scale-95 transition ${theme.secondaryBtn} text-center` }, "\uD83E\uDDEA \u5BA4\u5185\u7528\u30B7\u30DF\u30E5\u30EC\u30FC\u30BF\u30FC\u3067\u8A66\u3059"))) : (React.createElement("div", { className: "flex flex-col gap-2.5 mt-1" },
-                toastMessage && (React.createElement("div", { className: `p-2.5 rounded-2xl text-center text-xs animate-fade-in ${theme.toastWarn}` }, toastMessage)),
                 undoTargetId && (React.createElement("div", { className: `flex items-center justify-between p-2.5 rounded-2xl ${theme.undoBar}` },
                     React.createElement("span", { className: "text-xs" }, "\u304D\u308D\u304F\u3057\u307E\u3057\u305F"),
                     React.createElement("button", { onClick: handleUndoLastAction, className: `text-xs px-3 py-1.5 rounded-xl font-bold transition ${theme.undoBtn}` }, "\u5143\u306B\u623B\u3059 (3\u79D2)"))),
@@ -2996,54 +3176,181 @@ function KunKatsuApp() {
                         stopHoldProgress,
                         "%)")))))),
         activeTab === 'summary' && (React.createElement("section", { className: "p-4 flex flex-col gap-4" },
-            React.createElement("h2", { className: "text-base font-bold flex items-center gap-2" },
-                React.createElement("span", null, "\uD83D\uDCD6"),
-                " \u304A\u3055\u3093\u307D\u306E\u3075\u308A\u304B\u3048\u308A"),
-            latestWalk ? (React.createElement("div", { className: `p-4 rounded-3xl flex flex-col gap-3 ${theme.card}` },
-                React.createElement("div", { className: "h-64 w-full rounded-2xl overflow-hidden border border-orange-100/50" },
-                    React.createElement(DualMap, { engine: mapEngine, mapboxToken: profile?.mapboxPublicToken || '', darkMode: darkMode, centerLat: summaryCenter.lat, centerLng: summaryCenter.lng, routePoints: latestWalk.routePoints, actionLogs: latestWalk.actionLogs, activeLayer: "sniff" })),
-                React.createElement("div", { className: "grid grid-cols-2 gap-2 text-xs" },
-                    React.createElement("div", { className: `p-2.5 rounded-2xl border ${theme.statDistTile}` },
-                        React.createElement("span", { className: "text-[11px] font-medium block" }, "\uD83D\uDC3E \u3042\u308B\u3044\u305F\u304D\u3087\u308A"),
-                        React.createElement("p", { className: "text-base font-bold tabular-nums mt-0.5" },
-                            latestWalk.distanceMeters,
-                            " m")),
-                    React.createElement("div", { className: `p-2.5 rounded-2xl border ${theme.statTimeTile}` },
-                        React.createElement("span", { className: "text-[11px] font-medium block" }, "\u23F1\uFE0F \u304A\u3055\u3093\u307D\u6642\u9593"),
-                        React.createElement("p", { className: "text-base font-bold tabular-nums mt-0.5" }, formatTime(latestWalk.durationSec))),
-                    React.createElement("div", { className: `p-2.5 rounded-2xl border ${theme.statSniffTile}` },
-                        React.createElement("span", { className: "text-[11px] font-medium block" }, "\uD83D\uDC43 \u30AF\u30F3\u6D3B\u306E\u5408\u8A08"),
-                        React.createElement("p", { className: "text-base font-bold tabular-nums mt-0.5" }, formatTime(latestWalk.sniffDurationSec))),
-                    React.createElement("div", { className: `p-2.5 rounded-2xl border ${theme.statCalTile}` },
-                        React.createElement("span", { className: "text-[11px] font-medium block" }, "\uD83D\uDD25 \u98FC\u3044\u4E3B\u306E\u6D88\u8CBB"),
-                        React.createElement("p", { className: "text-base font-bold tabular-nums mt-0.5" },
-                            latestWalk.ownerCaloriesKcal,
-                            " kcal"))),
-                latestWalk.backgroundInterruptedSec && latestWalk.backgroundInterruptedSec > 0 ? (React.createElement("div", { className: `p-2.5 rounded-2xl flex items-center justify-between text-xs ${theme.toastWarn}` },
-                    React.createElement("span", { className: "flex items-center gap-1.5" },
-                        React.createElement("span", null, "\u26A0\uFE0F"),
-                        React.createElement("span", null, "\u753B\u9762\u304C\u6D88\u3048\u3066\u3044\u305F\uFF0F\u307B\u304B\u306E\u30A2\u30D7\u30EA\u3092\u958B\u3044\u3066\u3044\u305F\u6642\u9593")),
-                    React.createElement("span", { className: "font-bold tabular-nums" },
-                        "\u8A08 ",
-                        latestWalk.backgroundInterruptedSec,
-                        "\u79D2"))) : null,
-                React.createElement("div", { className: "flex flex-col gap-1.5 mt-1" },
-                    React.createElement("label", { className: `text-xs ${theme.textSecondary}` }, "\uD83D\uDCF7 \u304A\u3055\u3093\u307D\u5199\u771F\u3092\u8FFD\u52A0\uFF08\u5199\u771F\u306E\u4F4D\u7F6E\u60C5\u5831\u306F\u81EA\u52D5\u3067\u6D88\u53BB\u3055\u308C\u307E\u3059\uFF09"),
-                    React.createElement("input", { type: "file", accept: "image/*", onChange: async (e) => {
-                            const file = e.target.files?.[0];
-                            if (file && latestWalk) {
-                                const safeUrl = await stripImageExifAndResize(file);
-                                const updated = { ...latestWalk, safePhotoDataUrl: safeUrl };
-                                await saveWalkSession(updated);
-                                setLatestWalk(updated);
-                            }
-                        }, className: `text-xs rounded-xl ${theme.fileInput}` }),
-                    latestWalk.safePhotoDataUrl && (React.createElement("img", { src: latestWalk.safePhotoDataUrl, alt: "Sanitized Dog Photo", className: "w-full h-40 object-cover rounded-2xl mt-1 border border-orange-200/50" }))),
-                React.createElement("div", { className: "flex flex-col gap-1 mt-1" },
-                    React.createElement("button", { onClick: () => handleShareOrSave(latestWalk), disabled: isGeneratingShareImage, className: `w-full py-3.5 rounded-2xl font-bold text-sm flex items-center justify-center gap-2 active:scale-95 transition disabled:opacity-60 ${theme.primaryBtn}` }, isGeneratingShareImage ? (React.createElement("span", null, "\u23F3 \u753B\u50CF\u3092\u4F5C\u6210\u4E2D...")) : (React.createElement(React.Fragment, null,
-                        React.createElement("span", null, "\uD83D\uDCF8"),
-                        React.createElement("span", null, "\u8A18\u9332\u30AB\u30FC\u30C9\u3092\u4FDD\u5B58\u30FB\u30B7\u30A7\u30A2\u3059\u308B")))),
-                    React.createElement("p", { className: `text-[10px] text-center ${theme.textMuted}` }, "\uD83D\uDEE1\uFE0F \u81EA\u5B85\u306E\u307E\u308F\u308A\u306F\u304B\u304F\u3057\u3066\u4F5C\u6210\u3057\u307E\u3059")))) : (React.createElement("p", { className: `text-xs ${theme.textMuted} text-center py-10` }, "\u307E\u3060\u304A\u3055\u3093\u307D\u8A18\u9332\u304C\u3042\u308A\u307E\u305B\u3093\u3002")))),
+            React.createElement("div", { className: "flex items-center justify-between gap-2" },
+                React.createElement("h2", { className: "text-base font-bold flex items-center gap-2" },
+                    React.createElement("span", null, "\uD83D\uDCD6"),
+                    " \u304A\u3055\u3093\u307D\u306E\u3075\u308A\u304B\u3048\u308A"),
+                currentWalkIndex > 0 && allWalks.length > 0 && (React.createElement("button", { type: "button", onClick: () => selectWalk(allWalks[0].id), className: `px-2.5 py-1 rounded-xl text-[11px] font-semibold active:scale-95 transition ${theme.secondaryBtn}` }, "\u6700\u65B0\u306E\u8A18\u9332\u306B\u623B\u308B"))),
+            currentWalk ? (React.createElement(React.Fragment, null,
+                React.createElement("div", { className: `p-2.5 rounded-2xl border flex items-center justify-between gap-2 ${theme.card}` },
+                    React.createElement("button", { type: "button", disabled: currentWalkIndex < 0 || currentWalkIndex >= allWalks.length - 1, onClick: () => {
+                            const older = allWalks[currentWalkIndex + 1];
+                            if (older)
+                                selectWalk(older.id);
+                        }, className: `px-2.5 py-1.5 rounded-xl text-xs font-semibold active:scale-95 transition disabled:opacity-35 disabled:pointer-events-none ${theme.secondaryBtn}` }, "\u25C0 \u524D\u3078"),
+                    React.createElement("div", { className: "text-center min-w-0" },
+                        React.createElement("p", { className: `text-xs font-bold tabular-nums truncate ${theme.textPrimary}` }, formatSummaryDateTime(currentWalk.startTime)),
+                        React.createElement("p", { className: `text-[11px] tabular-nums ${theme.textMuted}` },
+                            "\uFF08",
+                            Math.max(currentWalkIndex + 1, 1),
+                            "/",
+                            allWalks.length,
+                            "\u4EF6\u76EE\uFF09")),
+                    React.createElement("button", { type: "button", disabled: currentWalkIndex <= 0, onClick: () => {
+                            const newer = allWalks[currentWalkIndex - 1];
+                            if (newer)
+                                selectWalk(newer.id);
+                        }, className: `px-2.5 py-1.5 rounded-xl text-xs font-semibold active:scale-95 transition disabled:opacity-35 disabled:pointer-events-none ${theme.secondaryBtn}` }, "\u6B21\u3078 \u25B6")),
+                React.createElement("div", { className: `p-4 rounded-3xl flex flex-col gap-3 ${theme.card}` },
+                    React.createElement("div", { className: "h-64 w-full rounded-2xl overflow-hidden border border-orange-100/50" },
+                        React.createElement(DualMap, { engine: mapEngine, mapboxToken: profile?.mapboxPublicToken || '', darkMode: darkMode, centerLat: summaryCenter.lat, centerLng: summaryCenter.lng, routePoints: currentWalk.routePoints, actionLogs: currentWalk.actionLogs, activeLayer: "sniff" })),
+                    React.createElement("div", { className: "grid grid-cols-2 gap-2 text-xs" },
+                        React.createElement("div", { className: `p-2.5 rounded-2xl border ${theme.statDistTile}` },
+                            React.createElement("span", { className: "text-[11px] font-medium block" }, "\uD83D\uDC3E \u3042\u308B\u3044\u305F\u304D\u3087\u308A"),
+                            React.createElement("p", { className: "text-base font-bold tabular-nums mt-0.5" },
+                                currentWalk.distanceMeters,
+                                " m")),
+                        React.createElement("div", { className: `p-2.5 rounded-2xl border ${theme.statTimeTile}` },
+                            React.createElement("span", { className: "text-[11px] font-medium block" }, "\u23F1\uFE0F \u304A\u3055\u3093\u307D\u6642\u9593"),
+                            React.createElement("p", { className: "text-base font-bold tabular-nums mt-0.5" }, formatTime(currentWalk.durationSec))),
+                        React.createElement("div", { className: `p-2.5 rounded-2xl border ${theme.statSniffTile}` },
+                            React.createElement("span", { className: "text-[11px] font-medium block" }, "\uD83D\uDC43 \u30AF\u30F3\u6D3B\u306E\u5408\u8A08"),
+                            React.createElement("p", { className: "text-base font-bold tabular-nums mt-0.5" }, formatTime(currentWalk.sniffDurationSec))),
+                        React.createElement("div", { className: `p-2.5 rounded-2xl border ${theme.statCalTile}` },
+                            React.createElement("span", { className: "text-[11px] font-medium block" }, "\uD83D\uDD25 \u98FC\u3044\u4E3B\u306E\u6D88\u8CBB"),
+                            React.createElement("p", { className: "text-base font-bold tabular-nums mt-0.5" },
+                                currentWalk.ownerCaloriesKcal,
+                                " kcal"))),
+                    currentWalk.backgroundInterruptedSec && currentWalk.backgroundInterruptedSec > 0 ? (React.createElement("div", { className: `p-2.5 rounded-2xl flex items-center justify-between text-xs ${theme.toastWarn}` },
+                        React.createElement("span", { className: "flex items-center gap-1.5" },
+                            React.createElement("span", null, "\u26A0\uFE0F"),
+                            React.createElement("span", null, "\u753B\u9762\u304C\u6D88\u3048\u3066\u3044\u305F\uFF0F\u307B\u304B\u306E\u30A2\u30D7\u30EA\u3092\u958B\u3044\u3066\u3044\u305F\u6642\u9593")),
+                        React.createElement("span", { className: "font-bold tabular-nums" },
+                            "\u8A08 ",
+                            currentWalk.backgroundInterruptedSec,
+                            "\u79D2"))) : null,
+                    React.createElement("div", { className: `p-3 rounded-2xl border flex flex-col gap-2 ${theme.subCard}` },
+                        React.createElement("div", { className: "flex items-center justify-between" },
+                            React.createElement("label", { htmlFor: "walk-memo-input", className: `text-xs font-bold ${theme.textPrimary}` }, "\uD83D\uDCDD \u304A\u3055\u3093\u307D\u30E1\u30E2"),
+                            React.createElement("span", { className: `text-[10px] tabular-nums ${theme.textMuted}` },
+                                memoDraft.length,
+                                "/200")),
+                        React.createElement("textarea", { id: "walk-memo-input", rows: 2, maxLength: 200, value: memoDraft, onChange: (e) => setMemoEdit({ walkId: currentWalk.id, text: e.target.value }), onBlur: () => {
+                                void saveWalkMemo(currentWalk, memoDraft, false);
+                            }, placeholder: "\u4ECA\u65E5\u306E\u69D8\u5B50\u3084\u6C17\u3065\u304D\u3092\u3072\u3068\u3053\u3068\u6B8B\u305B\u307E\u3059", className: `w-full rounded-xl p-2 text-xs resize-none ${theme.input}` }),
+                        React.createElement("div", { className: "flex items-center justify-between gap-2" },
+                            React.createElement("p", { className: `text-[11px] ${theme.textMuted}` }, "\u203B\u30E1\u30E2\u306F\u8A18\u9332\u30AB\u30FC\u30C9\u753B\u50CF\u306B\u3082\u8F09\u308A\u307E\u3059"),
+                            React.createElement("button", { type: "button", onClick: () => {
+                                    void saveWalkMemo(currentWalk, memoDraft, true);
+                                }, className: `px-3 py-1.5 rounded-xl text-xs font-semibold shrink-0 active:scale-95 transition ${theme.secondaryBtn}` }, "\u30E1\u30E2\u3092\u4FDD\u5B58"))),
+                    React.createElement("div", { className: "flex flex-col gap-1.5 mt-1" },
+                        React.createElement("label", { className: `text-xs ${theme.textSecondary}` }, "\uD83D\uDCF7 \u304A\u3055\u3093\u307D\u5199\u771F\u3092\u8FFD\u52A0\uFF08\u5199\u771F\u306E\u4F4D\u7F6E\u60C5\u5831\u306F\u81EA\u52D5\u3067\u6D88\u53BB\u3055\u308C\u307E\u3059\uFF09"),
+                        React.createElement("input", { type: "file", accept: "image/*", onChange: async (e) => {
+                                const file = e.target.files?.[0];
+                                e.target.value = '';
+                                if (file && currentWalk) {
+                                    const targetWalkId = currentWalk.id;
+                                    try {
+                                        const safeUrl = await stripImageExifAndResize(file);
+                                        const updated = { ...currentWalk, safePhotoDataUrl: safeUrl };
+                                        await saveWalkSession(updated);
+                                        setAllWalks((prev) => prev.map((w) => (w.id === targetWalkId ? { ...w, safePhotoDataUrl: safeUrl } : w)));
+                                        showToast('📷 おさんぽ写真を保存しました');
+                                    }
+                                    catch {
+                                        showToast('写真の読み込みに失敗しました');
+                                    }
+                                }
+                            }, className: `text-xs rounded-xl ${theme.fileInput}` }),
+                        currentWalk.safePhotoDataUrl && (React.createElement("div", { className: "relative mt-1" },
+                            React.createElement("img", { src: currentWalk.safePhotoDataUrl, alt: "Sanitized Dog Photo", className: "w-full h-40 object-cover rounded-2xl border border-orange-200/50" }),
+                            React.createElement("button", { type: "button", onClick: async () => {
+                                    const targetWalkId = currentWalk.id;
+                                    const updated = { ...currentWalk, safePhotoDataUrl: undefined };
+                                    try {
+                                        await saveWalkSession(updated);
+                                        setAllWalks((prev) => prev.map((w) => w.id === targetWalkId ? { ...w, safePhotoDataUrl: undefined } : w));
+                                        showToast('🗑️ 写真を外しました');
+                                    }
+                                    catch {
+                                        showToast('写真の削除に失敗しました');
+                                    }
+                                }, className: "absolute top-2 right-2 px-2.5 py-1 rounded-xl text-[11px] font-semibold bg-black/70 text-white backdrop-blur-sm active:scale-95 transition" }, "\uD83D\uDDD1\uFE0F \u5199\u771F\u3092\u5916\u3059")))),
+                    React.createElement("div", { className: "flex flex-col gap-1 mt-1" },
+                        React.createElement("button", { type: "button", onClick: () => {
+                                const latestMemo = memoDraft.slice(0, 200);
+                                const walkForShare = latestMemo === currentWalk.memo
+                                    ? currentWalk
+                                    : { ...currentWalk, memo: latestMemo };
+                                void handleShareOrSave(walkForShare);
+                            }, disabled: isGeneratingShareImage, className: `w-full py-3.5 rounded-2xl font-bold text-sm flex items-center justify-center gap-2 active:scale-95 transition disabled:opacity-60 ${theme.primaryBtn}` }, isGeneratingShareImage ? (React.createElement("span", null, "\u23F3 \u753B\u50CF\u3092\u4F5C\u6210\u4E2D...")) : (React.createElement(React.Fragment, null,
+                            React.createElement("span", null, "\uD83D\uDCF8"),
+                            React.createElement("span", null, "\u8A18\u9332\u30AB\u30FC\u30C9\u3092\u4FDD\u5B58\u30FB\u30B7\u30A7\u30A2\u3059\u308B")))),
+                        React.createElement("p", { className: `text-[10px] text-center ${theme.textMuted}` }, "\uD83D\uDEE1\uFE0F \u81EA\u5B85\u306E\u307E\u308F\u308A\u306F\u304B\u304F\u3057\u3066\u4F5C\u6210\u3057\u307E\u3059")),
+                    React.createElement("div", { className: "pt-2 border-t border-orange-200/20" }, deleteConfirmWalkId === currentWalk.id ? (React.createElement("div", { className: `p-3 rounded-2xl border flex flex-col gap-2 text-xs ${darkMode
+                            ? 'bg-rose-950/40 border-rose-500/40 text-rose-200'
+                            : 'bg-rose-50 border-rose-200 text-rose-800'}` },
+                        React.createElement("p", { className: "font-semibold" }, "\u3053\u306E\u304A\u3055\u3093\u307D\u8A18\u9332\u3092\u524A\u9664\u3057\u307E\u3059\u304B\uFF1F\uFF08\u5143\u306B\u623B\u305B\u307E\u305B\u3093\uFF09"),
+                        React.createElement("div", { className: "flex gap-2" },
+                            React.createElement("button", { type: "button", onClick: () => {
+                                    void handleDeleteWalk(currentWalk.id);
+                                }, className: "flex-1 py-2 rounded-xl font-bold bg-rose-600 text-white active:scale-95 transition" }, "\u524A\u9664\u3092\u78BA\u5B9A"),
+                            React.createElement("button", { type: "button", onClick: () => setDeleteConfirmWalkId(null), className: `flex-1 py-2 rounded-xl font-semibold active:scale-95 transition ${theme.secondaryBtn}` }, "\u30AD\u30E3\u30F3\u30BB\u30EB")))) : (React.createElement("button", { type: "button", onClick: () => setDeleteConfirmWalkId(currentWalk.id), className: `w-full py-2.5 rounded-2xl border text-xs font-semibold active:scale-95 transition ${darkMode
+                            ? 'border-rose-500/35 bg-rose-950/25 text-rose-300 hover:bg-rose-950/45'
+                            : 'border-rose-200 bg-rose-50/70 text-rose-700 hover:bg-rose-100/80'}` }, "\uD83D\uDDD1\uFE0F \u3053\u306E\u304A\u3055\u3093\u307D\u8A18\u9332\u3092\u524A\u9664")))),
+                React.createElement("div", { className: `p-4 rounded-3xl flex flex-col gap-3 ${theme.card}` },
+                    React.createElement("div", { className: "flex items-center justify-between gap-2" },
+                        React.createElement("h3", { className: `text-sm font-bold ${theme.textPrimary}` },
+                            "\uD83D\uDCDA \u3053\u308C\u307E\u3067\u306E\u304A\u3055\u3093\u307D\uFF08",
+                            allWalks.length,
+                            "\u4EF6\uFF09")),
+                    excludedWalkIds.length > 0 && (React.createElement("div", { className: "flex flex-col gap-2" }, bulkDeleteConfirm ? (React.createElement("div", { className: `p-3 rounded-2xl border flex flex-col gap-2 text-xs ${darkMode
+                            ? 'bg-rose-950/40 border-rose-500/40 text-rose-200'
+                            : 'bg-rose-50 border-rose-200 text-rose-800'}` },
+                        React.createElement("p", { className: "font-semibold" },
+                            "\u96C6\u8A08\u5BFE\u8C61\u5916\uFF08\u30C6\u30B9\u30C8\u30FB60\u79D2\u672A\u6E80\u30FB50m\u672A\u6E80\uFF09\u306E ",
+                            excludedWalkIds.length,
+                            "\u4EF6\u3092\u524A\u9664\u3057\u307E\u3059\u304B\uFF1F\uFF08\u5143\u306B\u623B\u305B\u307E\u305B\u3093\uFF09"),
+                        React.createElement("div", { className: "flex gap-2" },
+                            React.createElement("button", { type: "button", onClick: () => {
+                                    void handleBulkDeleteExcluded();
+                                }, className: "flex-1 py-2 rounded-xl font-bold bg-rose-600 text-white active:scale-95 transition" }, "\u307E\u3068\u3081\u3066\u524A\u9664\u3059\u308B"),
+                            React.createElement("button", { type: "button", onClick: () => setBulkDeleteConfirm(false), className: `flex-1 py-2 rounded-xl font-semibold active:scale-95 transition ${theme.secondaryBtn}` }, "\u30AD\u30E3\u30F3\u30BB\u30EB")))) : (React.createElement("button", { type: "button", onClick: () => setBulkDeleteConfirm(true), className: `w-full py-2 px-3 rounded-xl border text-xs font-semibold active:scale-95 transition ${darkMode
+                            ? 'border-amber-500/40 bg-amber-950/30 text-amber-200 hover:bg-amber-950/50'
+                            : 'border-amber-200 bg-amber-50 text-amber-800 hover:bg-amber-100'}` },
+                        "\uD83E\uDDF9 \u77ED\u3044\u30FB\u30C6\u30B9\u30C8\u8A18\u9332\u3092\u307E\u3068\u3081\u3066\u524A\u9664\uFF08",
+                        excludedWalkIds.length,
+                        "\u4EF6\uFF09")))),
+                    React.createElement("ul", { className: "flex flex-col gap-2" }, allWalks.map((walkItem) => {
+                        const isSelected = walkItem.id === currentWalk.id;
+                        const isExcluded = getWalkExclusionReason(walkItem) !== null;
+                        const hasPhoto = Boolean(walkItem.safePhotoDataUrl);
+                        const hasMemo = walkItem.memo.trim().length > 0;
+                        return (React.createElement("li", { key: walkItem.id },
+                            React.createElement("button", { type: "button", onClick: () => {
+                                    selectWalk(walkItem.id);
+                                    if (typeof window !== 'undefined') {
+                                        window.scrollTo({ top: 0, behavior: 'smooth' });
+                                    }
+                                }, className: `w-full text-left p-3 rounded-2xl border flex items-center justify-between gap-2 active:scale-[0.99] transition ${isSelected
+                                    ? darkMode
+                                        ? 'border-[#FF7D4E] bg-[#FF7D4E]/15'
+                                        : 'border-[#F0653A] bg-orange-50'
+                                    : theme.subCard}` },
+                                React.createElement("div", { className: "min-w-0 flex flex-col gap-0.5" },
+                                    React.createElement("span", { className: `text-xs font-bold tabular-nums ${theme.textPrimary}` }, formatSummaryDateTime(walkItem.startTime)),
+                                    React.createElement("span", { className: `text-[11px] tabular-nums ${theme.textSecondary}` },
+                                        "\uD83D\uDC3E ",
+                                        walkItem.distanceMeters,
+                                        " m \u30FB \u23F1\uFE0F ",
+                                        formatTime(walkItem.durationSec))),
+                                React.createElement("div", { className: "flex items-center gap-1 shrink-0 text-xs" },
+                                    hasPhoto && React.createElement("span", { title: "\u5199\u771F\u3042\u308A" }, "\uD83D\uDCF7"),
+                                    hasMemo && React.createElement("span", { title: "\u30E1\u30E2\u3042\u308A" }, "\uD83D\uDCDD"),
+                                    isExcluded && (React.createElement("span", { title: "\u96C6\u8A08\u5BFE\u8C61\u5916\uFF08\u30C6\u30B9\u30C8\u30FB\u77ED\u6642\u9593\uFF09", className: `px-1.5 py-0.5 rounded-md text-[10px] font-semibold ${darkMode
+                                            ? 'bg-amber-900/50 text-amber-200'
+                                            : 'bg-amber-100 text-amber-800'}` }, "\uD83E\uDDEA \u5BFE\u8C61\u5916"))))));
+                    }))))) : (React.createElement("p", { className: `text-xs ${theme.textMuted} text-center py-10` }, "\u307E\u3060\u304A\u3055\u3093\u307D\u8A18\u9332\u304C\u3042\u308A\u307E\u305B\u3093\u3002")))),
         activeTab === 'heatmap' && (React.createElement("section", { className: "p-4 flex flex-col gap-3" },
             React.createElement("h2", { className: "text-base font-bold flex items-center gap-2" },
                 React.createElement("span", null, "\uD83D\uDDFA\uFE0F"),
@@ -3072,34 +3379,84 @@ function KunKatsuApp() {
                             spot.count,
                             "\u56DE")));
                 }))) : (React.createElement("p", { className: `text-[11px] mt-1 ${theme.textMuted}` }, "\u304A\u3055\u3093\u307D\u8A18\u9332\u304C\u5897\u3048\u308B\u3068\u3001\u3088\u304F\u7ACB\u3061\u5BC4\u308B\u5834\u6240\u304C\u81EA\u52D5\u3067\u30E9\u30F3\u30AD\u30F3\u30B0\u3055\u308C\u307E\u3059\u3002"))))),
-        activeTab === 'stats' && (React.createElement(StatsDashboard, { walks: allWalks, darkMode: darkMode })),
+        activeTab === 'stats' && (React.createElement(StatsDashboard, { walks: allWalks, darkMode: darkMode, onSelectWalk: (walkId) => {
+                selectWalk(walkId);
+                switchTab('summary');
+                if (typeof window !== 'undefined') {
+                    window.scrollTo({ top: 0, behavior: 'smooth' });
+                }
+            } })),
         activeTab === 'settings' && profile && (React.createElement("section", { className: "p-4 flex flex-col gap-3 text-xs" },
             React.createElement("h2", { className: "text-base font-bold flex items-center gap-2" },
                 React.createElement("span", null, "\u2699\uFE0F"),
                 " \u8A2D\u5B9A\u30FB\u30D7\u30E9\u30A4\u30D0\u30B7\u30FC\u4FDD\u8B77"),
             React.createElement("div", { className: `p-3.5 rounded-2xl border flex flex-col gap-2.5 ${theme.card}` },
+                React.createElement("h3", { className: `font-bold text-sm ${theme.textPrimary}` }, "\uD83D\uDC15 \u611B\u72AC\u30FB\u98FC\u3044\u4E3B\u30D7\u30ED\u30D5\u30A3\u30FC\u30EB"),
+                React.createElement("p", { className: `text-[11px] leading-relaxed ${theme.textSecondary}` }, "\u611B\u72AC\u306E\u540D\u524D\u306F\u8A18\u9332\u30AB\u30FC\u30C9\uFF08\u30B7\u30A7\u30A2\u753B\u50CF\uFF09\u306B\u3001\u98FC\u3044\u4E3B\u306E\u4F53\u91CD\u306F\u6D88\u8CBB\u30AB\u30ED\u30EA\u30FC\u8A08\u7B97\u306B\u4F7F\u308F\u308C\u307E\u3059\u3002"),
+                React.createElement("div", { className: "flex flex-col gap-1" },
+                    React.createElement("label", { htmlFor: "dog-name-input", className: `font-medium ${theme.textSecondary}` }, "\u611B\u72AC\u306E\u540D\u524D"),
+                    React.createElement("input", { id: "dog-name-input", type: "text", maxLength: 30, placeholder: "\u4F8B: \u30DD\u30C1\uFF08\u7A7A\u6B04\u4FDD\u5B58\u6642\u306F\u300C\u611B\u72AC\u300D\uFF09", value: profile.name, onChange: (e) => setProfile({ ...profile, name: e.target.value }), className: `w-full px-3 py-2 rounded-xl text-xs ${theme.input}` })),
+                React.createElement("div", { className: "flex flex-col gap-1" },
+                    React.createElement("label", { htmlFor: "dog-breed-input", className: `font-medium ${theme.textSecondary}` }, "\u72AC\u7A2E"),
+                    React.createElement("input", { id: "dog-breed-input", type: "text", maxLength: 40, placeholder: "\u4F8B: \u67F4\u72AC\u30FB\u30DF\u30C3\u30AF\u30B9", value: profile.breed, onChange: (e) => setProfile({ ...profile, breed: e.target.value }), className: `w-full px-3 py-2 rounded-xl text-xs ${theme.input}` })),
+                React.createElement("div", { className: "grid grid-cols-2 gap-2.5" },
+                    React.createElement("div", { className: "flex flex-col gap-1" },
+                        React.createElement("label", { htmlFor: "dog-weight-input", className: `font-medium ${theme.textSecondary}` }, "\u611B\u72AC\u306E\u4F53\u91CD (kg)"),
+                        React.createElement("input", { id: "dog-weight-input", type: "number", step: "0.1", min: 0.5, max: 100, inputMode: "decimal", value: dogWeightDraft, onChange: (e) => setDogWeightDraft(e.target.value), onBlur: () => {
+                                const clamped = clampProfileNumber(dogWeightDraft, 0.5, 100, profile.weightKg, 1);
+                                setProfile((prev) => (prev ? { ...prev, weightKg: clamped } : prev));
+                                setDogWeightDraft(String(clamped));
+                            }, className: `w-full px-3 py-2 rounded-xl text-xs font-bold tabular-nums ${theme.input}` }),
+                        React.createElement("span", { className: `text-[10px] ${theme.textMuted}` }, "0.5\u301C100 kg")),
+                    React.createElement("div", { className: "flex flex-col gap-1" },
+                        React.createElement("label", { htmlFor: "owner-weight-input", className: `font-medium ${theme.textSecondary}` }, "\u98FC\u3044\u4E3B\u306E\u4F53\u91CD (kg)"),
+                        React.createElement("input", { id: "owner-weight-input", type: "number", step: "0.1", min: 20, max: 200, inputMode: "decimal", value: ownerWeightDraft, onChange: (e) => setOwnerWeightDraft(e.target.value), onBlur: () => {
+                                const clamped = clampProfileNumber(ownerWeightDraft, 20, 200, profile.ownerWeightKg, 1);
+                                setProfile((prev) => (prev ? { ...prev, ownerWeightKg: clamped } : prev));
+                                setOwnerWeightDraft(String(clamped));
+                            }, className: `w-full px-3 py-2 rounded-xl text-xs font-bold tabular-nums ${theme.input}` }),
+                        React.createElement("span", { className: `text-[10px] ${theme.textMuted}` }, "20\u301C200 kg"))),
+                React.createElement("div", { className: "flex flex-col gap-1" },
+                    React.createElement("label", { htmlFor: "dog-birthdate-input", className: `font-medium ${theme.textSecondary}` }, "\u304A\u8A95\u751F\u65E5"),
+                    React.createElement("input", { id: "dog-birthdate-input", type: "date", value: profile.birthDate, onChange: (e) => setProfile({ ...profile, birthDate: e.target.value }), className: `w-full px-3 py-2 rounded-xl text-xs ${theme.input}` }))),
+            React.createElement("div", { className: `p-3.5 rounded-2xl border flex flex-col gap-2.5 ${theme.card}` },
                 React.createElement("h3", { className: `font-bold text-sm ${theme.textPrimary}` }, "\uD83C\uDFE0 \u304A\u3046\u3061\u30D0\u30EC\u9632\u6B62\uFF08\u81EA\u5B85\u306E\u307E\u308F\u308A\u3092\u304B\u304F\u3059\uFF09"),
                 React.createElement("p", { className: `text-[11px] leading-relaxed ${theme.textSecondary}` }, "\u81EA\u5B85\u304B\u3089\u6307\u5B9A\u3057\u305F\u534A\u5F84\u5185\u306EGPS\u8A18\u9332\u3092\u81EA\u52D5\u3067\u6D88\u53BB\u3057\u307E\u3059\u3002 \u767B\u9332\u6642\u306B\u4E2D\u5FC3\u4F4D\u7F6E\u307830\u301C70m\u306E\u30E9\u30F3\u30C0\u30E0\u30AA\u30D5\u30BB\u30C3\u30C8\u304C\u9069\u7528\u3055\u308C\u308B\u305F\u3081\u3001\u5186\u306E\u4E2D\u5FC3\u304B\u3089\u81EA\u5B85\u3092\u7279\u5B9A\u3055\u308C\u308B\u5FC3\u914D\u3082\u3042\u308A\u307E\u305B\u3093\u3002"),
                 React.createElement("div", { className: "flex items-center gap-2" },
-                    React.createElement("label", { className: `font-medium ${theme.textSecondary}` }, "\u304B\u304F\u3059\u7BC4\u56F2\uFF08\u534A\u5F84\uFF09:"),
-                    React.createElement("input", { type: "number", min: 150, value: profile.geofenceRadiusMeters, onChange: (e) => {
-                            const val = Math.max(150, Number(e.target.value));
-                            setProfile({ ...profile, geofenceRadiusMeters: val });
+                    React.createElement("label", { htmlFor: "geofence-radius-input", className: `font-medium ${theme.textSecondary}` }, "\u304B\u304F\u3059\u7BC4\u56F2\uFF08\u534A\u5F84\uFF09:"),
+                    React.createElement("input", { id: "geofence-radius-input", type: "number", min: 150, inputMode: "numeric", value: geofenceRadiusDraft, onChange: (e) => setGeofenceRadiusDraft(e.target.value), onBlur: () => {
+                            const clamped = clampProfileNumber(geofenceRadiusDraft, 150, Number.MAX_SAFE_INTEGER, profile.geofenceRadiusMeters, 0);
+                            setProfile((prev) => (prev ? { ...prev, geofenceRadiusMeters: clamped } : prev));
+                            setGeofenceRadiusDraft(String(clamped));
                         }, className: `w-20 px-2.5 py-1 rounded-xl text-center font-bold tabular-nums ${theme.input}` }),
                     React.createElement("span", { className: theme.textSecondary }, "\u30E1\u30FC\u30C8\u30EB (150m\u4EE5\u4E0A)")),
                 React.createElement("button", { onClick: () => {
-                        const registerWithOffset = (rawLat, rawLng) => {
+                        const registerWithOffset = async (rawLat, rawLng) => {
+                            const latestProfile = profileRef.current ?? profile;
                             const { offsetLat, offsetLng } = applyHomeRandomOffset(rawLat, rawLng);
-                            setProfile({ ...profile, homeLat: offsetLat, homeLng: offsetLng });
+                            const radius = clampProfileNumber(geofenceRadiusDraft, 150, Number.MAX_SAFE_INTEGER, latestProfile.geofenceRadiusMeters, 0);
+                            const updatedProfile = {
+                                ...latestProfile,
+                                homeLat: offsetLat,
+                                homeLng: offsetLng,
+                                geofenceRadiusMeters: radius,
+                            };
+                            setProfile(updatedProfile);
+                            setGeofenceRadiusDraft(String(radius));
                             setCurrentLat(offsetLat);
                             setCurrentLng(offsetLng);
-                            alert('防犯のため、現在地から30〜70mランダムにずらした中心座標として安全に登録しました（真の自宅生座標は破棄されました）');
+                            await saveDogProfile(updatedProfile);
+                            showToast('🛡️ 自宅周辺（30〜70mずらし）を登録・保存しました');
                         };
                         if ('geolocation' in navigator) {
-                            navigator.geolocation.getCurrentPosition((pos) => registerWithOffset(pos.coords.latitude, pos.coords.longitude), () => registerWithOffset(currentLat, currentLng));
+                            navigator.geolocation.getCurrentPosition((pos) => {
+                                void registerWithOffset(pos.coords.latitude, pos.coords.longitude);
+                            }, () => {
+                                void registerWithOffset(currentLat, currentLng);
+                            });
                         }
                         else {
-                            registerWithOffset(currentLat, currentLng);
+                            void registerWithOffset(currentLat, currentLng);
                         }
                     }, className: `py-2 px-3 rounded-xl text-xs font-semibold active:scale-95 transition ${theme.secondaryBtn} w-fit` }, "\uD83D\uDCCD \u4ECA\u3044\u308B\u5834\u6240\u3092\u81EA\u5B85\u3068\u3057\u3066\u767B\u9332\uFF08\u4F4D\u7F6E\u306F\u81EA\u52D5\u3067\u305A\u3089\u3057\u307E\u3059\uFF09"),
                 profile.homeLat !== null && (React.createElement("span", { className: `text-xs px-2.5 py-1 rounded-full w-fit ${theme.mintBadge}` }, "\u2705 \u81EA\u5B85\u5468\u8FBA\u306E\u304B\u304F\u3057\u8A2D\u5B9A\u304C\u6709\u52B9\u3067\u3059"))),
@@ -3120,11 +3477,28 @@ function KunKatsuApp() {
                         await seedDemoWalkData(currentLat, currentLng);
                         const walks = await getAllWalks();
                         setAllWalks(walks);
-                        alert('デモ散歩データを IndexedDB に生成しました！');
+                        if (walks.length > 0)
+                            selectWalk(walks[0].id);
+                        showToast('🧪 デモ散歩データを端末内に生成しました');
                     }, className: `py-2 px-3 rounded-xl text-xs font-semibold active:scale-95 transition ${theme.secondaryBtn} w-full` }, "\u6563\u6B69\uFF06\u30AF\u30F3\u6D3B\u30C7\u30E2\u30C7\u30FC\u30BF\u3092\u6CE8\u5165")),
             React.createElement("button", { onClick: async () => {
-                    await saveDogProfile(profile);
-                    alert('設定を端末内ローカルに保存しました');
+                    const clampedDogWeight = clampProfileNumber(dogWeightDraft, 0.5, 100, profile.weightKg, 1);
+                    const clampedOwnerWeight = clampProfileNumber(ownerWeightDraft, 20, 200, profile.ownerWeightKg, 1);
+                    const clampedRadius = clampProfileNumber(geofenceRadiusDraft, 150, Number.MAX_SAFE_INTEGER, profile.geofenceRadiusMeters, 0);
+                    const normalizedProfile = {
+                        ...profile,
+                        name: profile.name.trim() || '愛犬',
+                        breed: profile.breed.trim(),
+                        weightKg: clampedDogWeight,
+                        ownerWeightKg: clampedOwnerWeight,
+                        geofenceRadiusMeters: clampedRadius,
+                    };
+                    setProfile(normalizedProfile);
+                    setDogWeightDraft(String(clampedDogWeight));
+                    setOwnerWeightDraft(String(clampedOwnerWeight));
+                    setGeofenceRadiusDraft(String(clampedRadius));
+                    await saveDogProfile(normalizedProfile);
+                    showToast('✅ 設定を端末内ローカルに保存しました');
                 }, className: `w-full py-3.5 rounded-full font-bold text-sm active:scale-95 transition ${theme.primaryBtn} mt-2` }, "\u8A2D\u5B9A\u3092\u4FDD\u5B58\u3059\u308B"))),
         showShareModalUrl && (React.createElement("div", { className: "fixed inset-0 z-50 bg-black/70 backdrop-blur-xs flex flex-col items-center justify-center p-4 select-none" },
             React.createElement("div", { className: `rounded-3xl p-4 max-w-sm w-full flex flex-col items-center gap-3 shadow-xl ${theme.card}` },
@@ -3138,19 +3512,19 @@ function KunKatsuApp() {
                         setShowShareModalUrl(null);
                     }, className: `w-full py-2.5 rounded-full text-xs font-bold active:scale-95 transition mt-1 ${theme.secondaryBtn}` }, "\u3068\u3058\u308B")))),
         React.createElement("nav", { className: `fixed bottom-0 inset-x-0 ${theme.nav} border-t backdrop-blur flex justify-around items-center py-2 px-1.5 gap-0.5 z-40` },
-            React.createElement("button", { onClick: () => setActiveTab('walk'), className: `flex-1 min-w-0 flex flex-col items-center justify-center py-1 px-1 rounded-full text-xs transition-all whitespace-nowrap ${activeTab === 'walk' ? theme.navItemActive : theme.navItemInactive}` },
+            React.createElement("button", { onClick: () => switchTab('walk'), className: `flex-1 min-w-0 flex flex-col items-center justify-center py-1 px-1 rounded-full text-xs transition-all whitespace-nowrap ${activeTab === 'walk' ? theme.navItemActive : theme.navItemInactive}` },
                 React.createElement("span", { className: "text-base leading-none" }, "\uD83D\uDC3E"),
                 React.createElement("span", { className: "text-[10px] sm:text-[11px] mt-0.5 leading-tight" }, "\u304A\u3055\u3093\u307D")),
-            React.createElement("button", { onClick: () => setActiveTab('summary'), className: `flex-1 min-w-0 flex flex-col items-center justify-center py-1 px-1 rounded-full text-xs transition-all whitespace-nowrap ${activeTab === 'summary' ? theme.navItemActive : theme.navItemInactive}` },
+            React.createElement("button", { onClick: () => switchTab('summary'), className: `flex-1 min-w-0 flex flex-col items-center justify-center py-1 px-1 rounded-full text-xs transition-all whitespace-nowrap ${activeTab === 'summary' ? theme.navItemActive : theme.navItemInactive}` },
                 React.createElement("span", { className: "text-base leading-none" }, "\uD83D\uDCD6"),
                 React.createElement("span", { className: "text-[10px] sm:text-[11px] mt-0.5 leading-tight" }, "\u3075\u308A\u304B\u3048\u308A")),
-            React.createElement("button", { onClick: () => setActiveTab('heatmap'), className: `flex-1 min-w-0 flex flex-col items-center justify-center py-1 px-1 rounded-full text-xs transition-all whitespace-nowrap ${activeTab === 'heatmap' ? theme.navItemActive : theme.navItemInactive}` },
+            React.createElement("button", { onClick: () => switchTab('heatmap'), className: `flex-1 min-w-0 flex flex-col items-center justify-center py-1 px-1 rounded-full text-xs transition-all whitespace-nowrap ${activeTab === 'heatmap' ? theme.navItemActive : theme.navItemInactive}` },
                 React.createElement("span", { className: "text-base leading-none" }, "\uD83D\uDDFA\uFE0F"),
                 React.createElement("span", { className: "text-[10px] sm:text-[11px] mt-0.5 leading-tight" }, "\u30DE\u30C3\u30D7")),
-            React.createElement("button", { onClick: () => setActiveTab('stats'), className: `flex-1 min-w-0 flex flex-col items-center justify-center py-1 px-1 rounded-full text-xs transition-all whitespace-nowrap ${activeTab === 'stats' ? theme.navItemActive : theme.navItemInactive}` },
+            React.createElement("button", { onClick: () => switchTab('stats'), className: `flex-1 min-w-0 flex flex-col items-center justify-center py-1 px-1 rounded-full text-xs transition-all whitespace-nowrap ${activeTab === 'stats' ? theme.navItemActive : theme.navItemInactive}` },
                 React.createElement("span", { className: "text-base leading-none" }, "\uD83D\uDCCA"),
                 React.createElement("span", { className: "text-[10px] sm:text-[11px] mt-0.5 leading-tight" }, "\u304D\u308D\u304F")),
-            React.createElement("button", { onClick: () => setActiveTab('settings'), className: `flex-1 min-w-0 flex flex-col items-center justify-center py-1 px-1 rounded-full text-xs transition-all whitespace-nowrap ${activeTab === 'settings' ? theme.navItemActive : theme.navItemInactive}` },
+            React.createElement("button", { onClick: () => switchTab('settings'), className: `flex-1 min-w-0 flex flex-col items-center justify-center py-1 px-1 rounded-full text-xs transition-all whitespace-nowrap ${activeTab === 'settings' ? theme.navItemActive : theme.navItemInactive}` },
                 React.createElement("span", { className: "text-base leading-none" }, "\u2699\uFE0F"),
                 React.createElement("span", { className: "text-[10px] sm:text-[11px] mt-0.5 leading-tight" }, "\u8A2D\u5B9A")))));
 }
