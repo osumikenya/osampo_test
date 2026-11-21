@@ -1787,45 +1787,45 @@ function evaluateDogWalkWeather(snapshot, dog, nowInput = Date.now()) {
         const isNearOrAfterSunset = Number.isFinite(sunsetMs) &&
             nowMs >= sunsetMs - CLIMATE_SUNSET_REMINDER_BEFORE_MS;
         if (!snapshot.isDay || isNearOrAfterSunset) {
-            sunsetReminder = `🌙 日没 ${sunsetTimeLabel}・ライトや反射材を忘れずに`;
+            sunsetReminder = 'ライト・反射材を忘れずに';
         }
     }
     else if (!snapshot.isDay) {
-        sunsetReminder = '🌙 夜間・暗い時間帯のためライトや反射材の着用がおすすめです';
+        sunsetReminder = '夜間はライトや反射材の着用が安心です';
     }
     let label = 'お散歩びより';
-    let headline = 'お散歩しやすい気候の目安です';
-    let advice = '穏やかな気象条件の目安です。愛犬の様子を見ながら楽しくお散歩できそうです。';
+    let headline = `体感${Math.round(snapshot.apparentTemperatureC)}℃・過ごしやすい気候です`;
+    let advice = '愛犬の様子を見ながら、いつものペースで気持ちよくお散歩できそうです。';
     switch (severity) {
         case 'heat_danger':
-            label = '暑さ警戒目安';
-            headline = `体感${Math.round(snapshot.apparentTemperatureC)}℃・暑さへの配慮が必要な目安です`;
+            label = '暑さ警戒';
+            headline = `体感${Math.round(snapshot.apparentTemperatureC)}℃・暑さがかなり強めです`;
             advice =
-                '暑さが強めの傾向です。涼しい時間帯への変更や日陰中心の短いコースをご検討いただくのがおすすめです。';
+                'アスファルトの熱さに注意し、涼しい時間帯や日陰中心の短いコースがおすすめです。';
             break;
         case 'rain_alert':
-            label = '3時間以内に雨予報';
-            headline = `3時間以内の降水確率 ${Math.round(maxRainProb3h)}% の予報です`;
+            label = '雨予報';
+            headline = `3時間以内の降水確率 ${Math.round(maxRainProb3h)}%`;
             advice =
-                '雨が降りやすい予報が出ています。レインコートの準備や、お散歩時間の前倒しをご検討ください。';
+                '雨が降りやすい予報です。レインコートの準備や、お散歩時間の前倒しをご検討ください。';
             break;
         case 'heat_caution':
-            label = '少し暑さ注意目安';
-            headline = `体感${Math.round(snapshot.apparentTemperatureC)}℃・やや暑さを感じやすい目安です`;
+            label = '暑さ注意';
+            headline = `体感${Math.round(snapshot.apparentTemperatureC)}℃・やや暑めです`;
             advice =
-                '日差しや照り返しの影響を受けやすい目安に入っています。地面の熱さやこまめな休憩・水分補給の目安にしてください。';
+                '日差しや地面の照り返しに気をつけて、こまめな休憩と水分補給を意識しましょう。';
             break;
         case 'cold_caution':
-            label = '少し寒さ注意目安';
-            headline = `体感${Math.round(snapshot.apparentTemperatureC)}℃・肌寒さを感じやすい目安です`;
+            label = '寒さ注意';
+            headline = `体感${Math.round(snapshot.apparentTemperatureC)}℃・ひんやりしています`;
             advice =
-                '冷え込みやすい傾向です。愛犬のふるえや歩く様子を見ながら、ウェアの着用や短めの調整をおすすめします。';
+                '冷え込みが気になる気温です。愛犬のふるえなど様子を見つつ、ウェア着用や短めの調整が安心です。';
             break;
         case 'wind_caution':
-            label = '強風注意目安';
-            headline = `風速${snapshot.windSpeedMs.toFixed(1)}m/s・風が強めの傾向です`;
+            label = '強風注意';
+            headline = `風速${snapshot.windSpeedMs.toFixed(1)}m/s・風が強めです`;
             advice =
-                '風にあおられやすい気象条件です。リードをしっかり持ち、周囲の落下物や足元に気をつけてお散歩ください。';
+                '風にあおられやすい天気です。リードをしっかり持ち、落下物や足元にお気をつけください。';
             break;
         case 'good':
             break;
