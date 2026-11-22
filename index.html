@@ -1846,14 +1846,102 @@ function evaluateDogWalkWeather(snapshot, dog, nowInput = Date.now()) {
 
 
 // --- DualMap.tsx ---
-function DualMap({ engine, mapboxToken, darkMode, centerLat, centerLng, routePoints, actionLogs, activeLayer, }) {
+const DUAL_MAP_RANK_MEDALS = {
+    1: '🥇',
+    2: '🥈',
+    3: '🥉',
+};
+function clearDualMapMarkers(markersRef) {
+    markersRef.current.forEach((marker) => {
+        try {
+            marker.remove();
+        }
+        catch {
+            // 既に破棄済みの場合は無視
+        }
+    });
+    markersRef.current = [];
+}
+function syncDualMapRankedMarkers(map, spots, useMapbox, isDarkMode, markersRef) {
+    clearDualMapMarkers(markersRef);
+    if (!map || !spots || spots.length === 0)
+        return;
+    const nextMarkers = [];
+    for (const spot of spots) {
+        if (!Number.isFinite(spot.lat) || !Number.isFinite(spot.lng))
+            continue;
+        const wrapper = document.createElement('div');
+        wrapper.setAttribute('aria-label', `お気に入りクン活スポット ${spot.rank}位`);
+        wrapper.style.pointerEvents = 'none';
+        wrapper.style.userSelect = 'none';
+        const badge = document.createElement('div');
+        badge.textContent = DUAL_MAP_RANK_MEDALS[spot.rank];
+        badge.style.display = 'flex';
+        badge.style.alignItems = 'center';
+        badge.style.justifyContent = 'center';
+        badge.style.width = '30px';
+        badge.style.height = '30px';
+        badge.style.borderRadius = '9999px';
+        badge.style.fontSize = '18px';
+        badge.style.lineHeight = '1';
+        badge.style.backgroundColor = isDarkMode
+            ? 'rgba(30, 27, 46, 0.92)'
+            : 'rgba(255, 255, 255, 0.95)';
+        badge.style.border = spot.rank === 1 ? '2px solid #f59e0b' : '2px solid #fb923c';
+        badge.style.boxShadow = '0 3px 10px rgba(0, 0, 0, 0.28)';
+        const stem = document.createElement('div');
+        stem.style.width = '0';
+        stem.style.height = '0';
+        stem.style.margin = '0 auto';
+        stem.style.borderLeft = '5px solid transparent';
+        stem.style.borderRight = '5px solid transparent';
+        stem.style.borderTop = spot.rank === 1 ? '6px solid #f59e0b' : '6px solid #fb923c';
+        wrapper.appendChild(badge);
+        wrapper.appendChild(stem);
+        const marker = useMapbox
+            ? new mapboxgl.Marker({ element: wrapper, anchor: 'bottom' })
+                .setLngLat([spot.lng, spot.lat])
+                .addTo(map)
+            : new maplibregl.Marker({ element: wrapper, anchor: 'bottom' })
+                .setLngLat([spot.lng, spot.lat])
+                .addTo(map);
+        nextMarkers.push(marker);
+    }
+    markersRef.current = nextMarkers;
+}
+function DualMap({ engine, mapboxToken, darkMode, centerLat, centerLng, routePoints, actionLogs, activeLayer, rankedSpots, focusPoint, onActionTap, showAllActionPoints = false, encounters, onEncounterTap, }) {
     const containerRef = useRef(null);
     const mapInstanceRef = useRef(null);
     const isLoadedRef = useRef(false);
+    const isMapboxEngineRef = useRef(false);
+    const rankedMarkersRef = useRef([]);
+    const lastFocusKeyRef = useRef(null);
+    const onActionTapRef = useRef(onActionTap);
+    useEffect(() => {
+        onActionTapRef.current = onActionTap;
+    }, [onActionTap]);
+    const onEncounterTapRef = useRef(onEncounterTap);
+    useEffect(() => {
+        onEncounterTapRef.current = onEncounterTap;
+    }, [onEncounterTap]);
     // タイルソース切替（OSM標準 ⇄ 国土地理院タイル）
     const [tileProvider, setTileProvider] = useState('osm');
-    const latestPropsRef = useRef({ routePoints, actionLogs, activeLayer });
-    latestPropsRef.current = { routePoints, actionLogs, activeLayer };
+    const latestPropsRef = useRef({
+        routePoints,
+        actionLogs,
+        activeLayer,
+        rankedSpots,
+        showAllActionPoints,
+        encounters,
+    });
+    latestPropsRef.current = {
+        routePoints,
+        actionLogs,
+        activeLayer,
+        rankedSpots,
+        showAllActionPoints,
+        encounters,
+    };
     // GeoJSON生成ヘルパー
     const createRouteGeoJson = (pts) => ({
         type: 'FeatureCollection',
@@ -1869,10 +1957,12 @@ function DualMap({ engine, mapboxToken, darkMode, centerLat, centerLng, routePoi
             ]
             : [],
     });
-    const createPointsGeoJson = (logs, layer) => ({
+    const createPointsGeoJson = (logs, layer, includeAll = false) => ({
         type: 'FeatureCollection',
         features: logs
             .filter((log) => {
+            if (includeAll)
+                return true;
             if (layer === 'sniff')
                 return log.type === 'sniff_auto' || log.type === 'sniff_manual';
             if (layer === 'excretion')
@@ -1882,6 +1972,7 @@ function DualMap({ engine, mapboxToken, darkMode, centerLat, centerLng, routePoi
             .map((log) => ({
             type: 'Feature',
             properties: {
+                id: log.id,
                 weight: log.weight,
                 type: log.type,
                 durationSec: log.durationSec,
@@ -1892,16 +1983,35 @@ function DualMap({ engine, mapboxToken, darkMode, centerLat, centerLng, routePoi
             },
         })),
     });
+    const createEncountersGeoJson = (items = []) => ({
+        type: 'FeatureCollection',
+        features: items
+            .filter((item) => Number.isFinite(item.lat) && Number.isFinite(item.lng))
+            .map((item) => ({
+            type: 'Feature',
+            properties: {
+                id: item.id,
+                name: item.name ?? '',
+                breed: item.breed ?? '',
+            },
+            geometry: {
+                type: 'Point',
+                coordinates: [item.lng, item.lat],
+            },
+        })),
+    });
     // 1. 地図インスタンスの初期化
     useEffect(() => {
         if (!containerRef.current)
             return;
         isLoadedRef.current = false;
         if (mapInstanceRef.current) {
+            clearDualMapMarkers(rankedMarkersRef);
             mapInstanceRef.current.remove();
             mapInstanceRef.current = null;
         }
         const useMapbox = engine === 'mapbox' && mapboxToken.trim().length > 10;
+        isMapboxEngineRef.current = useMapbox;
         // APIキー完全不要・WebWorker不要で確実に描画されるラスタータイル方式
         const rasterTiles = tileProvider === 'osm'
             ? ['https://tile.openstreetmap.org/{z}/{x}/{y}.png']
@@ -1947,6 +2057,13 @@ function DualMap({ engine, mapboxToken, darkMode, centerLat, centerLng, routePoi
             });
         }
         else {
+            const maplibreVersion = typeof maplibregl.getVersion === 'function' ? maplibregl.getVersion() : '';
+            if (typeof window !== 'undefined' &&
+                maplibreVersion.startsWith('6.') &&
+                typeof maplibregl.setWorkerUrl === 'function' &&
+                !maplibregl.getWorkerUrl?.()) {
+                maplibregl.setWorkerUrl('/maplibre-gl-worker.mjs');
+            }
             map = new maplibregl.Map({
                 container: containerRef.current,
                 style: rasterStyle,
@@ -1958,7 +2075,7 @@ function DualMap({ engine, mapboxToken, darkMode, centerLat, centerLng, routePoi
         map.on('load', () => {
             isLoadedRef.current = true;
             map.resize();
-            const { routePoints: currentRoutes, actionLogs: currentLogs, activeLayer: currentLayer, } = latestPropsRef.current;
+            const { routePoints: currentRoutes, actionLogs: currentLogs, activeLayer: currentLayer, showAllActionPoints: currentIncludeAll, encounters: currentEncounters, } = latestPropsRef.current;
             // ルート軌跡ソース＆レイヤー
             map.addSource('walk-route', {
                 type: 'geojson',
@@ -1981,7 +2098,7 @@ function DualMap({ engine, mapboxToken, darkMode, centerLat, centerLng, routePoi
             // アクションポイント（クン活・排泄）ソース＆ヒートマップ
             map.addSource('action-points', {
                 type: 'geojson',
-                data: createPointsGeoJson(currentLogs, currentLayer),
+                data: createPointsGeoJson(currentLogs, currentLayer, currentIncludeAll),
             });
             map.addLayer({
                 id: 'kunkatsu-heatmap',
@@ -2043,6 +2160,74 @@ function DualMap({ engine, mapboxToken, darkMode, centerLat, centerLng, routePoi
                     'circle-stroke-color': '#ffffff',
                 },
             });
+            // タップ判定拡大用透明ヒットレイヤー
+            map.addLayer({
+                id: 'action-hit',
+                type: 'circle',
+                source: 'action-points',
+                paint: {
+                    'circle-radius': 16,
+                    'circle-opacity': 0,
+                },
+            });
+            map.on('mouseenter', 'action-hit', () => {
+                if (onActionTapRef.current) {
+                    map.getCanvas().style.cursor = 'pointer';
+                }
+            });
+            map.on('mouseleave', 'action-hit', () => {
+                map.getCanvas().style.cursor = '';
+            });
+            map.on('click', 'action-hit', (e) => {
+                if (!onActionTapRef.current)
+                    return;
+                const tappedId = e.features?.[0]?.properties?.id;
+                if (typeof tappedId === 'string' && tappedId.length > 0) {
+                    onActionTapRef.current(tappedId);
+                }
+            });
+            // すれ違ったわんちゃん地点ソース＆緑系円マーカー
+            map.addSource('encounter-points', {
+                type: 'geojson',
+                data: createEncountersGeoJson(currentEncounters),
+            });
+            map.addLayer({
+                id: 'encounter-circles',
+                type: 'circle',
+                source: 'encounter-points',
+                paint: {
+                    'circle-radius': 8,
+                    'circle-color': '#10b981',
+                    'circle-stroke-width': 2.5,
+                    'circle-stroke-color': '#ffffff',
+                },
+            });
+            map.addLayer({
+                id: 'encounter-hit',
+                type: 'circle',
+                source: 'encounter-points',
+                paint: {
+                    'circle-radius': 16,
+                    'circle-opacity': 0,
+                },
+            });
+            map.on('mouseenter', 'encounter-hit', () => {
+                if (onEncounterTapRef.current) {
+                    map.getCanvas().style.cursor = 'pointer';
+                }
+            });
+            map.on('mouseleave', 'encounter-hit', () => {
+                map.getCanvas().style.cursor = '';
+            });
+            map.on('click', 'encounter-hit', (e) => {
+                if (!onEncounterTapRef.current)
+                    return;
+                const tappedId = e.features?.[0]?.properties?.id;
+                if (typeof tappedId === 'string' && tappedId.length > 0) {
+                    onEncounterTapRef.current(tappedId);
+                }
+            });
+            syncDualMapRankedMarkers(map, latestPropsRef.current.rankedSpots, useMapbox, darkMode, rankedMarkersRef);
         });
         // リサイズ監視（タブ切替時や画面サイズ変更時）
         const resizeObserver = new ResizeObserver(() => {
@@ -2055,6 +2240,7 @@ function DualMap({ engine, mapboxToken, darkMode, centerLat, centerLng, routePoi
         }
         return () => {
             resizeObserver.disconnect();
+            clearDualMapMarkers(rankedMarkersRef);
             if (mapInstanceRef.current) {
                 mapInstanceRef.current.remove();
                 mapInstanceRef.current = null;
@@ -2078,13 +2264,39 @@ function DualMap({ engine, mapboxToken, darkMode, centerLat, centerLng, routePoi
         }
         const actionSource = map.getSource('action-points');
         if (actionSource) {
-            actionSource.setData(createPointsGeoJson(actionLogs, activeLayer));
+            actionSource.setData(createPointsGeoJson(actionLogs, activeLayer, showAllActionPoints));
+        }
+        const encounterSource = map.getSource('encounter-points');
+        if (encounterSource) {
+            encounterSource.setData(createEncountersGeoJson(encounters));
         }
         if (map.getLayer('walk-route-line')) {
             map.setPaintProperty('walk-route-line', 'line-color', activeLayer === 'route' ? '#0d9488' : '#F0653A');
             map.setPaintProperty('walk-route-line', 'line-width', activeLayer === 'route' ? 7 : 4);
         }
-    }, [routePoints, actionLogs, activeLayer]);
+    }, [routePoints, actionLogs, activeLayer, showAllActionPoints, encounters]);
+    // 4. Top3クン活スポットの🥇🥈🥉ピン描画・クリーンアップ
+    useEffect(() => {
+        if (!mapInstanceRef.current || !isLoadedRef.current)
+            return;
+        syncDualMapRankedMarkers(mapInstanceRef.current, rankedSpots, isMapboxEngineRef.current, darkMode, rankedMarkersRef);
+    }, [rankedSpots, darkMode]);
+    // 5. 指定スポットへのスムーズズーム（key変化時のみ発火）
+    useEffect(() => {
+        if (!focusPoint || !mapInstanceRef.current)
+            return;
+        if (lastFocusKeyRef.current === focusPoint.key)
+            return;
+        lastFocusKeyRef.current = focusPoint.key;
+        const map = mapInstanceRef.current;
+        if (typeof map.flyTo === 'function') {
+            map.flyTo({
+                center: [focusPoint.lng, focusPoint.lat],
+                zoom: 17.5,
+                essential: true,
+            });
+        }
+    }, [focusPoint]);
     return (React.createElement("div", { className: `relative w-full h-full rounded-2xl overflow-hidden border ${darkMode ? 'border-[#3A3450] bg-[#1C1A27]' : 'border-orange-100 bg-[#FFF7EC]'}` },
         React.createElement("div", { ref: containerRef, className: "absolute inset-0 w-full h-full" }),
         React.createElement("div", { className: "absolute top-2 left-2 z-10 flex items-center gap-1.5" },
@@ -3229,7 +3441,224 @@ function WeatherCard({ snapshot, loading, error, dog, darkMode, onRefresh, onOpe
 }
 
 
+// --- MapPointEditSheet.tsx ---
+const MAP_POINT_EDIT_TYPE_META = {
+    sniff_manual: {
+        emoji: '👃',
+        label: '手動クン活',
+        badgeDark: 'bg-amber-900/50 text-amber-200 border-amber-700/60',
+        badgeLight: 'bg-amber-50 text-amber-900 border-amber-200',
+    },
+    sniff_auto: {
+        emoji: '🐾',
+        label: '自動クン活',
+        badgeDark: 'bg-yellow-900/40 text-yellow-200 border-yellow-700/60',
+        badgeLight: 'bg-yellow-50 text-yellow-900 border-yellow-200',
+    },
+    pee: {
+        emoji: '💧',
+        label: 'おしっこ',
+        badgeDark: 'bg-sky-900/40 text-sky-200 border-sky-700/60',
+        badgeLight: 'bg-sky-50 text-sky-900 border-sky-200',
+    },
+    poop: {
+        emoji: '💩',
+        label: 'うんち',
+        badgeDark: 'bg-purple-900/40 text-purple-200 border-purple-700/60',
+        badgeLight: 'bg-purple-50 text-purple-900 border-purple-200',
+    },
+};
+const MAP_POINT_EDIT_POOP_OPTIONS = [
+    { value: 'normal', label: '快便' },
+    { value: 'soft', label: '軟便' },
+    { value: 'hard', label: '硬め' },
+    { value: undefined, label: '未設定' },
+];
+function mapPointEditFormatTimestamp(timestamp) {
+    const date = new Date(timestamp);
+    const hour = String(date.getHours()).padStart(2, '0');
+    const minute = String(date.getMinutes()).padStart(2, '0');
+    const second = String(date.getSeconds()).padStart(2, '0');
+    return `${hour}:${minute}:${second}`;
+}
+function MapPointEditSheet({ log, darkMode, isSaving = false, onClose, onUpdatePoopCondition, onDelete, }) {
+    const [confirmingDelete, setConfirmingDelete] = useState(false);
+    if (!log)
+        return null;
+    const meta = MAP_POINT_EDIT_TYPE_META[log.type];
+    const isSniff = log.type === 'sniff_auto' || log.type === 'sniff_manual';
+    return (React.createElement("div", { className: "fixed inset-0 z-50 bg-black/60 backdrop-blur-xs flex items-end sm:items-center justify-center p-3 sm:p-4", onClick: onClose, role: "dialog", "aria-modal": "true", "aria-labelledby": "map-point-edit-title" },
+        React.createElement("div", { className: `w-full max-w-md rounded-3xl p-4 sm:p-5 flex flex-col gap-3.5 shadow-2xl border ${darkMode
+                ? 'bg-[#28243A] border-[#3A3450] text-[#F5EFE6]'
+                : 'bg-white border-orange-200 text-stone-800'}`, onClick: (e) => e.stopPropagation() },
+            React.createElement("div", { className: "flex items-start justify-between gap-2" },
+                React.createElement("div", { className: "flex flex-col gap-1" },
+                    React.createElement("div", { className: "flex items-center gap-2 flex-wrap" },
+                        React.createElement("span", { id: "map-point-edit-title", className: `inline-flex items-center gap-1.5 px-2.5 py-1 rounded-full text-xs font-bold border ${darkMode ? meta.badgeDark : meta.badgeLight}` },
+                            React.createElement("span", null, meta.emoji),
+                            React.createElement("span", null, meta.label)),
+                        React.createElement("span", { className: `text-xs font-semibold tabular-nums ${darkMode ? 'text-[#B8AFA3]' : 'text-stone-600'}` },
+                            "\uD83D\uDD52 ",
+                            mapPointEditFormatTimestamp(log.timestamp))),
+                    isSniff && log.durationSec > 0 && (React.createElement("p", { className: `text-xs ${darkMode ? 'text-[#B8AFA3]' : 'text-stone-600'}` },
+                        "\u6EDE\u5728\u6642\u9593: ",
+                        React.createElement("span", { className: "font-bold tabular-nums" },
+                            log.durationSec,
+                            "\u79D2")))),
+                React.createElement("button", { type: "button", onClick: onClose, "aria-label": "\u9589\u3058\u308B", className: `w-9 h-9 rounded-full flex items-center justify-center text-sm font-bold transition active:scale-95 ${darkMode
+                        ? 'bg-[#3A3450] text-[#F5EFE6] hover:bg-[#484163]'
+                        : 'bg-orange-50 text-stone-600 hover:bg-orange-100'}` }, "\u2715")),
+            log.type === 'poop' && (React.createElement("div", { className: `p-3 rounded-2xl border flex flex-col gap-2 ${darkMode
+                    ? 'bg-[#1C1A27]/70 border-[#3A3450]'
+                    : 'bg-purple-50/50 border-purple-200/80'}` },
+                React.createElement("p", { className: `text-xs font-bold ${darkMode ? 'text-purple-200' : 'text-purple-900'}` }, "\uD83D\uDCA9 \u3046\u3093\u3061\u306E\u72B6\u614B\u3092\u7DE8\u96C6"),
+                React.createElement("div", { className: "grid grid-cols-2 gap-2" }, MAP_POINT_EDIT_POOP_OPTIONS.map((opt) => {
+                    const isSelected = log.poopCondition === opt.value;
+                    return (React.createElement("button", { key: opt.label, type: "button", disabled: isSaving, onClick: () => onUpdatePoopCondition(log.id, opt.value), className: `min-h-[44px] px-3 py-2 rounded-xl text-xs font-bold border transition active:scale-95 disabled:opacity-50 ${isSelected
+                            ? darkMode
+                                ? 'bg-purple-600 text-white border-purple-400 shadow-sm'
+                                : 'bg-purple-600 text-white border-purple-700 shadow-sm'
+                            : darkMode
+                                ? 'bg-[#28243A] text-[#F5EFE6] border-[#4E4768] hover:bg-[#3A3450]'
+                                : 'bg-white text-stone-700 border-purple-200 hover:bg-purple-50'}` }, isSelected ? `✓ ${opt.label}` : opt.label));
+                })))),
+            React.createElement("div", { className: `pt-2 border-t flex flex-col gap-2 ${darkMode ? 'border-[#3A3450]' : 'border-orange-100'}` },
+                confirmingDelete ? (React.createElement("div", { className: `p-3 rounded-2xl border flex flex-col gap-2.5 ${darkMode
+                        ? 'bg-rose-950/40 border-rose-700/60 text-rose-200'
+                        : 'bg-rose-50 border-rose-200 text-rose-800'}` },
+                    React.createElement("p", { className: "text-xs font-bold" }, "\u3053\u306E\u8A18\u9332\u3092\u524A\u9664\u3057\u307E\u3059\u304B\uFF1F\uFF08\u524A\u9664\u5F8C\u306F\u5143\u306B\u623B\u305B\u307E\u305B\u3093\uFF09"),
+                    React.createElement("div", { className: "grid grid-cols-2 gap-2" },
+                        React.createElement("button", { type: "button", disabled: isSaving, onClick: () => onDelete(log.id), className: "min-h-[44px] rounded-xl text-xs font-bold bg-rose-600 hover:bg-rose-700 text-white transition active:scale-95 disabled:opacity-50" }, "\u306F\u3044\u3001\u524A\u9664\u3059\u308B"),
+                        React.createElement("button", { type: "button", disabled: isSaving, onClick: () => setConfirmingDelete(false), className: `min-h-[44px] rounded-xl text-xs font-bold border transition active:scale-95 disabled:opacity-50 ${darkMode
+                                ? 'bg-[#3A3450] border-[#4E4768] text-[#F5EFE6] hover:bg-[#484163]'
+                                : 'bg-white border-stone-200 text-stone-700 hover:bg-stone-50'}` }, "\u30AD\u30E3\u30F3\u30BB\u30EB")))) : (React.createElement("button", { type: "button", disabled: isSaving, onClick: () => setConfirmingDelete(true), className: `w-full min-h-[44px] rounded-2xl text-xs font-bold border transition active:scale-95 disabled:opacity-50 ${darkMode
+                        ? 'bg-rose-950/30 border-rose-800/60 text-rose-300 hover:bg-rose-900/40'
+                        : 'bg-rose-50 border-rose-200 text-rose-700 hover:bg-rose-100'}` }, "\uD83D\uDDD1\uFE0F \u3053\u306E\u8A18\u9332\u3092\u524A\u9664")),
+                React.createElement("button", { type: "button", onClick: onClose, className: `w-full min-h-[44px] rounded-full text-xs font-bold transition active:scale-95 ${darkMode
+                        ? 'bg-[#3A3450] text-[#F5EFE6] hover:bg-[#484163]'
+                        : 'bg-orange-100/80 text-stone-700 hover:bg-orange-200/70'}` }, "\u3068\u3058\u308B")))));
+}
+
+
+// --- EncounterQuickSheet.tsx ---
+const ENCOUNTER_SHEET_MAX_NAME_LEN = 30;
+const ENCOUNTER_SHEET_MAX_BREED_LEN = 30;
+const ENCOUNTER_SHEET_MAX_FEATURES_LEN = 100;
+function encounterSheetFormatTimestamp(timestamp) {
+    const date = new Date(timestamp);
+    const hour = String(date.getHours()).padStart(2, '0');
+    const minute = String(date.getMinutes()).padStart(2, '0');
+    const second = String(date.getSeconds()).padStart(2, '0');
+    return `${hour}:${minute}:${second}`;
+}
+function encounterSheetNormalizeOptionalText(raw, maxLen) {
+    const trimmed = raw.trim();
+    if (!trimmed)
+        return undefined;
+    return Array.from(trimmed).slice(0, maxLen).join('');
+}
+function EncounterQuickSheet({ encounter, mode, darkMode, isSaving = false, onSave, onSkip, onDelete, onClose, }) {
+    const [name, setName] = useState(encounter?.name ?? '');
+    const [breed, setBreed] = useState(encounter?.breed ?? '');
+    const [features, setFeatures] = useState(encounter?.features ?? '');
+    const [confirmingDelete, setConfirmingDelete] = useState(false);
+    if (!encounter)
+        return null;
+    const featuresCharCount = Array.from(features).length;
+    const handleSubmit = (e) => {
+        e.preventDefault();
+        if (isSaving)
+            return;
+        onSave(encounter.id, {
+            name: encounterSheetNormalizeOptionalText(name, ENCOUNTER_SHEET_MAX_NAME_LEN),
+            breed: encounterSheetNormalizeOptionalText(breed, ENCOUNTER_SHEET_MAX_BREED_LEN),
+            features: encounterSheetNormalizeOptionalText(features, ENCOUNTER_SHEET_MAX_FEATURES_LEN),
+        });
+    };
+    const handleDismiss = () => {
+        if (mode === 'walk' && onSkip) {
+            onSkip();
+        }
+        else {
+            onClose();
+        }
+    };
+    const inputClass = `w-full rounded-2xl px-3.5 py-2.5 text-base border transition focus:outline-none focus:ring-2 focus:ring-emerald-400/60 ${darkMode
+        ? 'bg-[#1C1A27] border-[#3A3450] text-[#F5EFE6] placeholder-[#8E857B]'
+        : 'bg-orange-50/40 border-orange-200 text-stone-800 placeholder-stone-400'}`;
+    return (React.createElement("div", { className: "fixed inset-0 z-50 bg-black/60 backdrop-blur-xs flex items-end sm:items-center justify-center p-3 sm:p-4", onClick: handleDismiss, role: "dialog", "aria-modal": "true", "aria-labelledby": "encounter-quick-sheet-title" },
+        React.createElement("form", { onSubmit: handleSubmit, className: `w-full max-w-md rounded-3xl p-4 sm:p-5 flex flex-col gap-3.5 shadow-2xl border max-h-[90vh] overflow-y-auto ${darkMode
+                ? 'bg-[#28243A] border-[#3A3450] text-[#F5EFE6]'
+                : 'bg-white border-orange-200 text-stone-800'}`, onClick: (e) => e.stopPropagation() },
+            React.createElement("div", { className: "flex items-start justify-between gap-2" },
+                React.createElement("div", { className: "flex flex-col gap-1" },
+                    React.createElement("div", { className: "flex items-center gap-2 flex-wrap" },
+                        React.createElement("span", { id: "encounter-quick-sheet-title", className: `inline-flex items-center gap-1.5 px-2.5 py-1 rounded-full text-xs font-bold border ${darkMode
+                                ? 'bg-emerald-950/60 text-emerald-200 border-emerald-700/60'
+                                : 'bg-emerald-50 text-emerald-800 border-emerald-200'}` },
+                            React.createElement("span", null, "\uD83D\uDC15"),
+                            React.createElement("span", null, "\u3059\u308C\u9055\u3063\u305F\u308F\u3093\u3061\u3083\u3093")),
+                        React.createElement("span", { className: `text-xs font-mono tabular-nums ${darkMode ? 'text-[#B8AFA3]' : 'text-stone-500'}` },
+                            "\uD83D\uDD52 ",
+                            encounterSheetFormatTimestamp(encounter.timestamp))),
+                    React.createElement("p", { className: `text-[11px] ${darkMode ? 'text-[#B8AFA3]' : 'text-stone-500'}` }, mode === 'walk'
+                        ? '場所は記録済みです（入力中もGPS・タイマーは動き続けます）'
+                        : '後から名前や特徴を追記・修正できます')),
+                React.createElement("button", { type: "button", onClick: handleDismiss, disabled: isSaving, "aria-label": "\u3068\u3058\u308B", className: `min-h-[40px] min-w-[40px] rounded-full text-sm font-bold flex items-center justify-center active:scale-95 transition ${darkMode
+                        ? 'bg-[#3A3450] text-[#F5EFE6] hover:bg-[#484163]'
+                        : 'bg-orange-50 text-stone-600 hover:bg-orange-100'}` }, "\u2715")),
+            React.createElement("div", { className: "flex flex-col gap-2.5" },
+                React.createElement("div", { className: "flex flex-col gap-1" },
+                    React.createElement("label", { htmlFor: "encounter-dog-name", className: `text-xs font-bold ${darkMode ? 'text-[#F5EFE6]' : 'text-stone-700'}` }, "\u304A\u540D\u524D\uFF08\u308F\u304B\u3089\u306A\u3051\u308C\u3070\u7A7A\u6B04\u3067OK\uFF09"),
+                    React.createElement("input", { id: "encounter-dog-name", type: "text", value: name, maxLength: ENCOUNTER_SHEET_MAX_NAME_LEN, onChange: (e) => setName(e.target.value), placeholder: "\u4F8B\uFF1A\u30DD\u30C1 / \u8336\u8272\u306E\u67F4\u3061\u3083\u3093", className: inputClass })),
+                React.createElement("div", { className: "flex flex-col gap-1" },
+                    React.createElement("label", { htmlFor: "encounter-dog-breed", className: `text-xs font-bold ${darkMode ? 'text-[#F5EFE6]' : 'text-stone-700'}` }, "\u72AC\u7A2E\uFF08\u4EFB\u610F\uFF09"),
+                    React.createElement("input", { id: "encounter-dog-breed", type: "text", value: breed, maxLength: ENCOUNTER_SHEET_MAX_BREED_LEN, onChange: (e) => setBreed(e.target.value), placeholder: "\u4F8B\uFF1A\u67F4\u72AC / \u30C8\u30A4\u30D7\u30FC\u30C9\u30EB / MIX", className: inputClass })),
+                React.createElement("div", { className: "flex flex-col gap-1" },
+                    React.createElement("div", { className: "flex items-center justify-between" },
+                        React.createElement("label", { htmlFor: "encounter-dog-features", className: `text-xs font-bold ${darkMode ? 'text-[#F5EFE6]' : 'text-stone-700'}` }, "\u7279\u5FB4\u30E1\u30E2\uFF08\u4EFB\u610F\u30FB100\u6587\u5B57\u4EE5\u5185\uFF09"),
+                        React.createElement("span", { className: `text-[11px] tabular-nums ${darkMode ? 'text-[#8E857B]' : 'text-stone-400'}` },
+                            featuresCharCount,
+                            "/",
+                            ENCOUNTER_SHEET_MAX_FEATURES_LEN)),
+                    React.createElement("textarea", { id: "encounter-dog-features", rows: 2, value: features, maxLength: ENCOUNTER_SHEET_MAX_FEATURES_LEN, onChange: (e) => setFeatures(e.target.value), placeholder: "\u4F8B\uFF1A\u8D64\u3044\u30CF\u30FC\u30CD\u30B9\u3001\u4EBA\u61D0\u3063\u3053\u3044\u3001\u3054\u3042\u3044\u3055\u3064\u3067\u304D\u305F", className: `${inputClass} resize-none` }))),
+            React.createElement("div", { className: "flex flex-col gap-2 pt-1" },
+                React.createElement("button", { type: "submit", disabled: isSaving, className: "w-full min-h-[48px] py-3 rounded-2xl text-sm font-bold bg-emerald-600 hover:bg-emerald-500 text-white shadow-md active:scale-95 transition disabled:opacity-60" }, isSaving ? '保存中...' : '保存する'),
+                mode === 'walk' && (React.createElement("button", { type: "button", onClick: handleDismiss, disabled: isSaving, className: `w-full min-h-[44px] py-2.5 rounded-2xl text-xs font-bold border active:scale-95 transition ${darkMode
+                        ? 'bg-[#3A3450] border-[#4E4768] text-[#F5EFE6] hover:bg-[#484163]'
+                        : 'bg-orange-50/70 border-orange-200 text-stone-700 hover:bg-orange-100/70'}` }, "\u3042\u3068\u3067\uFF08\u5834\u6240\u3060\u3051\u6B8B\u3057\u3066\u9589\u3058\u308B\uFF09"))),
+            onDelete && (React.createElement("div", { className: "pt-2 border-t border-orange-200/20" }, confirmingDelete ? (React.createElement("div", { className: `p-3 rounded-2xl border flex flex-col gap-2 text-xs ${darkMode
+                    ? 'bg-rose-950/40 border-rose-500/40 text-rose-200'
+                    : 'bg-rose-50 border-rose-200 text-rose-800'}` },
+                React.createElement("p", { className: "font-semibold" }, "\u3053\u306E\u3059\u308C\u9055\u3044\u8A18\u9332\u3092\u524A\u9664\u3057\u307E\u3059\u304B\uFF1F"),
+                React.createElement("div", { className: "flex gap-2" },
+                    React.createElement("button", { type: "button", disabled: isSaving, onClick: () => onDelete(encounter.id), className: "flex-1 min-h-[44px] py-2 rounded-xl font-bold bg-rose-600 text-white active:scale-95 transition disabled:opacity-60" }, isSaving ? '削除中...' : '削除する'),
+                    React.createElement("button", { type: "button", disabled: isSaving, onClick: () => setConfirmingDelete(false), className: `flex-1 min-h-[44px] py-2 rounded-xl font-semibold active:scale-95 transition ${darkMode
+                            ? 'bg-[#3A3450] text-[#F5EFE6] border border-[#4E4768]'
+                            : 'bg-white text-stone-700 border border-orange-200'}` }, "\u3084\u3081\u308B")))) : (React.createElement("button", { type: "button", disabled: isSaving, onClick: () => setConfirmingDelete(true), className: `w-full min-h-[44px] py-2.5 rounded-2xl border text-xs font-semibold active:scale-95 transition ${darkMode
+                    ? 'border-rose-500/35 bg-rose-950/25 text-rose-300 hover:bg-rose-950/45'
+                    : 'border-rose-200 bg-rose-50/70 text-rose-700 hover:bg-rose-100/80'}` }, "\uD83D\uDDD1\uFE0F \u3053\u306E\u3059\u308C\u9055\u3044\u8A18\u9332\u3092\u524A\u9664")))),
+            React.createElement("p", { className: `text-[10px] text-center ${darkMode ? 'text-[#8E857B]' : 'text-stone-400'}` }, "\uD83D\uDD12 \u3053\u306E\u30E1\u30E2\u306F\u7AEF\u672B\u5185\u306E\u307F\u306B\u4FDD\u5B58\u3055\u308C\u3001SNS\u30B7\u30A7\u30A2\u753B\u50CF\u306B\u306F\u542B\u307E\u308C\u307E\u305B\u3093"))));
+}
+
+
 // --- page.tsx ---
+const UNDO_WINDOW_MS = 3000;
+const POOP_SELECTOR_WINDOW_MS = 10000;
+const POOP_CONDITION_OPTIONS = [
+    { value: 'normal', label: '快便' },
+    { value: 'soft', label: '軟便' },
+    { value: 'hard', label: '硬め' },
+];
+function createWalkDogEncounter(lat, lng) {
+    const now = Date.now();
+    return {
+        id: `enc_${now}`,
+        timestamp: now,
+        lat,
+        lng,
+    };
+}
 function KunKatsuApp() {
     const [activeTab, setActiveTab] = useState('walk');
     const [profile, setProfile] = useState(null);
@@ -3262,6 +3691,7 @@ function KunKatsuApp() {
             sniffBtn: 'bg-[#FFD15C] hover:bg-[#F5C445] text-amber-950 shadow-md shadow-black/25',
             peeBtn: 'bg-sky-900/40 hover:bg-sky-900/60 text-sky-200 border border-sky-700/50',
             poopBtn: 'bg-violet-900/40 hover:bg-violet-900/60 text-violet-200 border border-violet-700/50',
+            encounterBtn: 'bg-emerald-900/40 hover:bg-emerald-900/60 text-emerald-200 border border-emerald-700/50',
             stopBarWrap: 'bg-rose-900/30 border border-rose-800/50',
             stopBarFill: 'bg-rose-700/50',
             stopBarText: 'text-rose-300',
@@ -3310,6 +3740,7 @@ function KunKatsuApp() {
             sniffBtn: 'bg-[#FFD15C] hover:bg-[#F5C445] text-amber-950 shadow-md shadow-amber-500/20',
             peeBtn: 'bg-sky-100 hover:bg-sky-200/80 text-sky-800 border border-sky-200',
             poopBtn: 'bg-violet-100 hover:bg-violet-200/80 text-violet-800 border border-violet-200',
+            encounterBtn: 'bg-emerald-100 hover:bg-emerald-200/80 text-emerald-800 border border-emerald-200',
             stopBarWrap: 'bg-rose-50 border border-rose-200',
             stopBarFill: 'bg-rose-200',
             stopBarText: 'text-rose-600',
@@ -3343,17 +3774,29 @@ function KunKatsuApp() {
     const [currentLng, setCurrentLng] = useState(132.4553);
     const [routePoints, setRoutePoints] = useState([]);
     const [actionLogs, setActionLogs] = useState([]);
+    const [encounters, setEncounters] = useState([]);
+    const [activeWalkEncounterId, setActiveWalkEncounterId] = useState(null);
     const [geofenceMaskedCount, setGeofenceMaskedCount] = useState(0);
     const [undoTargetId, setUndoTargetId] = useState(null);
     const [showPoopSelectorForId, setShowPoopSelectorForId] = useState(null);
+    const [poopSelectorRemainingMs, setPoopSelectorRemainingMs] = useState(0);
+    const undoTimeoutRef = useRef(null);
+    const poopSelectorTimeoutRef = useRef(null);
+    const poopSelectorIntervalRef = useRef(null);
     const [stopHoldProgress, setStopHoldProgress] = useState(0);
     const [selectedWalkId, setSelectedWalkId] = useState(null);
     const [allWalks, setAllWalks] = useState([]);
     const [memoEdit, setMemoEdit] = useState(null);
     const [deleteConfirmWalkId, setDeleteConfirmWalkId] = useState(null);
     const [bulkDeleteConfirm, setBulkDeleteConfirm] = useState(false);
+    const [editingActionLogId, setEditingActionLogId] = useState(null);
+    const [isSavingActionEdit, setIsSavingActionEdit] = useState(false);
+    const [editingSummaryEncounterId, setEditingSummaryEncounterId] = useState(null);
+    const [isSavingEncounterEdit, setIsSavingEncounterEdit] = useState(false);
     const [heatmapLayer, setHeatmapLayer] = useState('sniff');
     const [periodFilter, setPeriodFilter] = useState('all');
+    const [heatmapFocusPoint, setHeatmapFocusPoint] = useState(null);
+    const heatmapMapContainerRef = useRef(null);
     const [dogWeightDraft, setDogWeightDraft] = useState('28');
     const [ownerWeightDraft, setOwnerWeightDraft] = useState('65');
     const [geofenceRadiusDraft, setGeofenceRadiusDraft] = useState('200');
@@ -3436,6 +3879,8 @@ function KunKatsuApp() {
     const resetSummaryConfirmations = () => {
         setDeleteConfirmWalkId(null);
         setBulkDeleteConfirm(false);
+        setEditingActionLogId(null);
+        setEditingSummaryEncounterId(null);
     };
     const selectWalk = (walkId) => {
         setSelectedWalkId(walkId);
@@ -3678,20 +4123,49 @@ function KunKatsuApp() {
             catch (_) { }
         }
     };
-    // D2合意: 記録完了フィードバック（①0.3秒画面発光 ②Android振動＋iOS18スイッチ触覚［実験的］ ③任意設定のWeb Audio効果音）
-    // ※すべてtry/catchで独立保護し、失敗しても記録自体は必ず成功させる
-    const triggerCompletionFeedback = (type) => {
-        // ① 0.3秒（300ms）画面発光
+    const clearUndoTimer = useCallback(() => {
+        if (undoTimeoutRef.current) {
+            clearTimeout(undoTimeoutRef.current);
+            undoTimeoutRef.current = null;
+        }
+    }, []);
+    const clearPoopSelectorTimers = useCallback(() => {
+        if (poopSelectorTimeoutRef.current) {
+            clearTimeout(poopSelectorTimeoutRef.current);
+            poopSelectorTimeoutRef.current = null;
+        }
+        if (poopSelectorIntervalRef.current) {
+            clearInterval(poopSelectorIntervalRef.current);
+            poopSelectorIntervalRef.current = null;
+        }
+    }, []);
+    useEffect(() => {
+        return () => {
+            clearUndoTimer();
+            clearPoopSelectorTimers();
+            if (flashTimeoutRef.current) {
+                clearTimeout(flashTimeoutRef.current);
+                flashTimeoutRef.current = null;
+            }
+        };
+    }, [clearUndoTimer, clearPoopSelectorTimers]);
+    const triggerLockScreenFlash = (color) => {
         try {
             if (flashTimeoutRef.current)
                 clearTimeout(flashTimeoutRef.current);
-            const color = type === 'pee' ? 'sky' : type === 'poop' ? 'purple' : 'amber';
             setLockFlashColor(color);
             flashTimeoutRef.current = setTimeout(() => {
                 setLockFlashColor(null);
             }, 300);
         }
         catch (_) { }
+    };
+    // D2合意: 記録完了フィードバック（①0.3秒画面発光 ②Android振動＋iOS18スイッチ触覚［実験的］ ③任意設定のWeb Audio効果音）
+    // ※すべてtry/catchで独立保護し、失敗しても記録自体は必ず成功させる
+    const triggerCompletionFeedback = (type) => {
+        // ① 0.3秒（300ms）画面発光
+        const color = type === 'pee' ? 'sky' : type === 'poop' ? 'purple' : 'amber';
+        triggerLockScreenFlash(color);
         // ② Android Vibration API
         if (type === 'sniff_manual')
             triggerVibration([40, 60, 40]);
@@ -3736,17 +4210,18 @@ function KunKatsuApp() {
             showToast('🛡️ 自宅マスク範囲内（防犯保護のため記録スキップ）');
             return;
         }
-        const logId = `manual_${Date.now()}`;
+        const now = Date.now();
+        const logId = `manual_${now}`;
         const newLog = {
             id: logId,
             walkId: 'current',
-            timestamp: Date.now(),
+            timestamp: now,
             lat: currentLat,
             lng: currentLng,
             type,
             durationSec: type === 'sniff_manual' ? 15 : 10,
             weight: 3,
-            poopCondition: type === 'poop' ? 'normal' : undefined,
+            poopCondition: undefined,
         };
         if (type === 'sniff_manual') {
             setSniffTotalSec((s) => s + 15);
@@ -3755,13 +4230,30 @@ function KunKatsuApp() {
         setUndoTargetId(logId);
         // 記録確定後にフィードバックを発火（失敗しても記録に影響しない）
         triggerCompletionFeedback(type);
-        if (type === 'poop' && !pocketLock) {
-            setShowPoopSelectorForId(logId);
-        }
-        setTimeout(() => {
+        clearUndoTimer();
+        undoTimeoutRef.current = setTimeout(() => {
             setUndoTargetId((current) => (current === logId ? null : current));
-            setShowPoopSelectorForId((current) => (current === logId ? null : current));
-        }, 3000);
+            undoTimeoutRef.current = null;
+        }, UNDO_WINDOW_MS);
+        if (type === 'poop') {
+            clearPoopSelectorTimers();
+            const deadline = now + POOP_SELECTOR_WINDOW_MS;
+            setShowPoopSelectorForId(logId);
+            setPoopSelectorRemainingMs(POOP_SELECTOR_WINDOW_MS);
+            poopSelectorIntervalRef.current = setInterval(() => {
+                const remaining = Math.max(0, deadline - Date.now());
+                setPoopSelectorRemainingMs(remaining);
+                if (remaining <= 0 && poopSelectorIntervalRef.current) {
+                    clearInterval(poopSelectorIntervalRef.current);
+                    poopSelectorIntervalRef.current = null;
+                }
+            }, 100);
+            poopSelectorTimeoutRef.current = setTimeout(() => {
+                setShowPoopSelectorForId((current) => (current === logId ? null : current));
+                setPoopSelectorRemainingMs(0);
+                clearPoopSelectorTimers();
+            }, POOP_SELECTOR_WINDOW_MS);
+        }
     };
     const handleUndoLastAction = () => {
         if (!undoTargetId)
@@ -3771,25 +4263,56 @@ function KunKatsuApp() {
             setSniffTotalSec((s) => Math.max(0, s - target.durationSec));
         }
         setActionLogs((prev) => prev.filter((l) => l.id !== undoTargetId));
+        clearUndoTimer();
+        if (showPoopSelectorForId === undoTargetId) {
+            clearPoopSelectorTimers();
+            setShowPoopSelectorForId(null);
+            setPoopSelectorRemainingMs(0);
+        }
         setUndoTargetId(null);
-        setShowPoopSelectorForId(null);
     };
     const handleSelectPoopCondition = (cond) => {
         if (!showPoopSelectorForId)
             return;
         setActionLogs((prev) => prev.map((l) => l.id === showPoopSelectorForId ? { ...l, poopCondition: cond } : l));
+        clearPoopSelectorTimers();
         setShowPoopSelectorForId(null);
+        setPoopSelectorRemainingMs(0);
+        if (pocketLock) {
+            triggerLockScreenFlash('purple');
+            triggerVibration(35);
+        }
+    };
+    const handleRecordEncounter = () => {
+        if (!isWalking)
+            return;
+        if (profile &&
+            isInsideHomeGeofence(currentLat, currentLng, profile.homeLat, profile.homeLng, profile.geofenceRadiusMeters)) {
+            showToast('🛡️ 自宅マスク範囲内（防犯保護のため記録スキップ）');
+            return;
+        }
+        const newEncounter = createWalkDogEncounter(currentLat, currentLng);
+        setEncounters((prev) => [...prev, newEncounter]);
+        triggerVibration(35);
+        setActiveWalkEncounterId(newEncounter.id);
     };
     const startWalk = (withSimulator = false) => {
         const now = Date.now();
         walkStartTimeRef.current = now;
         lastGpsReceivedAtRef.current = null;
         walkStartWeatherRef.current = weatherSnapshotRef.current;
+        clearUndoTimer();
+        clearPoopSelectorTimers();
+        setUndoTargetId(null);
+        setShowPoopSelectorForId(null);
+        setPoopSelectorRemainingMs(0);
         setElapsedSec(0);
         setDistanceMeters(0);
         setSniffTotalSec(0);
         setRoutePoints([]);
         setActionLogs([]);
+        setEncounters([]);
+        setActiveWalkEncounterId(null);
         setGeofenceMaskedCount(0);
         lastPointRef.current = null;
         slowStartTimestampRef.current = null;
@@ -3805,6 +4328,12 @@ function KunKatsuApp() {
         const endTime = Date.now();
         const startTime = walkStartTimeRef.current ?? endTime - elapsedSec * 1000;
         const finalDurationSec = Math.max(1, Math.round((endTime - startTime) / 1000));
+        clearUndoTimer();
+        clearPoopSelectorTimers();
+        setUndoTargetId(null);
+        setShowPoopSelectorForId(null);
+        setPoopSelectorRemainingMs(0);
+        setActiveWalkEncounterId(null);
         setIsWalking(false);
         setIsSimulating(false);
         setPocketLock(false);
@@ -3826,6 +4355,7 @@ function KunKatsuApp() {
             ownerCaloriesKcal: calculateOwnerCalories(finalDurationSec, ownerWeight),
             routePoints,
             actionLogs,
+            ...(encounters.length > 0 ? { encounters } : {}),
             memo: '',
             backgroundInterruptedSec: totalInterruptedSecRef.current,
             ...(startWeather ? { weather: startWeather } : {}),
@@ -3886,7 +4416,145 @@ function KunKatsuApp() {
     const memoDraft = currentWalk && memoEdit?.walkId === currentWalk.id
         ? memoEdit.text
         : (currentWalk?.memo ?? '');
-    const buildShareCacheKey = (walk, dogName) => `${walk.id}:${walk.memo}:${walk.safePhotoDataUrl ?? ''}:${dogName}`;
+    const buildShareCacheKey = (walk, dogName) => {
+        const logsSig = walk.actionLogs
+            .map((l) => `${l.id}:${l.poopCondition ?? ''}`)
+            .join(',');
+        return `${walk.id}:${walk.memo}:${walk.safePhotoDataUrl ?? ''}:${dogName}:${walk.sniffDurationSec}:${walk.actionLogs.length}:${logsSig}`;
+    };
+    const editingActionLog = useMemo(() => {
+        if (!currentWalk || !editingActionLogId)
+            return null;
+        return currentWalk.actionLogs.find((l) => l.id === editingActionLogId) ?? null;
+    }, [currentWalk, editingActionLogId]);
+    const handleUpdateActionPoopCondition = async (logId, condition) => {
+        if (!currentWalk || isSavingActionEdit)
+            return;
+        const target = currentWalk.actionLogs.find((l) => l.id === logId);
+        if (!target || target.type !== 'poop')
+            return;
+        const nextLogs = currentWalk.actionLogs.map((l) => l.id === logId ? { ...l, poopCondition: condition } : l);
+        const updated = { ...currentWalk, actionLogs: nextLogs };
+        setIsSavingActionEdit(true);
+        try {
+            await saveWalkSession(updated);
+            setAllWalks((prev) => prev.map((w) => (w.id === currentWalk.id ? updated : w)));
+            const label = POOP_CONDITION_OPTIONS.find((opt) => opt.value === condition)?.label ?? '未設定';
+            showToast(`💩 うんちの状態を「${label}」に更新しました`);
+        }
+        catch {
+            showToast('記録の更新に失敗しました');
+        }
+        finally {
+            setIsSavingActionEdit(false);
+        }
+    };
+    const handleDeleteActionLog = async (logId) => {
+        if (!currentWalk || isSavingActionEdit)
+            return;
+        const target = currentWalk.actionLogs.find((l) => l.id === logId);
+        if (!target)
+            return;
+        const isSniff = target.type === 'sniff_auto' || target.type === 'sniff_manual';
+        const nextLogs = currentWalk.actionLogs.filter((l) => l.id !== logId);
+        const nextSniffDurationSec = isSniff
+            ? Math.max(0, currentWalk.sniffDurationSec - target.durationSec)
+            : currentWalk.sniffDurationSec;
+        const updated = {
+            ...currentWalk,
+            actionLogs: nextLogs,
+            sniffDurationSec: nextSniffDurationSec,
+        };
+        setIsSavingActionEdit(true);
+        try {
+            await saveWalkSession(updated);
+            setAllWalks((prev) => prev.map((w) => (w.id === currentWalk.id ? updated : w)));
+            setEditingActionLogId(null);
+            showToast('🗑️ マップの記録を削除しました');
+        }
+        catch {
+            showToast('記録の削除に失敗しました');
+        }
+        finally {
+            setIsSavingActionEdit(false);
+        }
+    };
+    const activeWalkEncounter = useMemo(() => {
+        if (!isWalking || !activeWalkEncounterId)
+            return null;
+        return encounters.find((item) => item.id === activeWalkEncounterId) ?? null;
+    }, [isWalking, activeWalkEncounterId, encounters]);
+    const editingSummaryEncounter = useMemo(() => {
+        if (!currentWalk || !editingSummaryEncounterId)
+            return null;
+        return ((currentWalk.encounters ?? []).find((item) => item.id === editingSummaryEncounterId) ?? null);
+    }, [currentWalk, editingSummaryEncounterId]);
+    const handleSaveActiveWalkEncounter = (encounterId, patch) => {
+        setEncounters((prev) => prev.map((item) => item.id === encounterId
+            ? {
+                ...item,
+                name: patch.name,
+                breed: patch.breed,
+                features: patch.features,
+            }
+            : item));
+        setActiveWalkEncounterId(null);
+        showToast('🐕 すれ違いメモを保存しました');
+    };
+    const handleUpdateSummaryEncounter = async (encounterId, patch) => {
+        if (!currentWalk || isSavingEncounterEdit)
+            return;
+        const currentEncounters = currentWalk.encounters ?? [];
+        if (!currentEncounters.some((item) => item.id === encounterId))
+            return;
+        const nextEncounters = currentEncounters.map((item) => item.id === encounterId
+            ? {
+                ...item,
+                name: patch.name,
+                breed: patch.breed,
+                features: patch.features,
+            }
+            : item);
+        const updated = { ...currentWalk, encounters: nextEncounters };
+        setIsSavingEncounterEdit(true);
+        try {
+            await saveWalkSession(updated);
+            setAllWalks((prev) => prev.map((w) => (w.id === currentWalk.id ? updated : w)));
+            setEditingSummaryEncounterId(null);
+            showToast('🐕 すれ違いメモを更新しました');
+        }
+        catch {
+            showToast('すれ違いメモの更新に失敗しました');
+        }
+        finally {
+            setIsSavingEncounterEdit(false);
+        }
+    };
+    const handleDeleteSummaryEncounter = async (encounterId) => {
+        if (!currentWalk || isSavingEncounterEdit)
+            return;
+        const currentEncounters = currentWalk.encounters ?? [];
+        if (!currentEncounters.some((item) => item.id === encounterId))
+            return;
+        const nextEncounters = currentEncounters.filter((item) => item.id !== encounterId);
+        const updated = {
+            ...currentWalk,
+            encounters: nextEncounters.length > 0 ? nextEncounters : undefined,
+        };
+        setIsSavingEncounterEdit(true);
+        try {
+            await saveWalkSession(updated);
+            setAllWalks((prev) => prev.map((w) => (w.id === currentWalk.id ? updated : w)));
+            setEditingSummaryEncounterId(null);
+            showToast('🗑️ すれ違い記録を削除しました');
+        }
+        catch {
+            showToast('すれ違い記録の削除に失敗しました');
+        }
+        finally {
+            setIsSavingEncounterEdit(false);
+        }
+    };
     const currentDogName = profile?.name || '愛犬';
     const currentShareCacheKey = currentWalk
         ? buildShareCacheKey(currentWalk, currentDogName)
@@ -3984,20 +4652,44 @@ function KunKatsuApp() {
         const sniffs = filteredWalks.flatMap((w) => w.actionLogs.filter((l) => l.type === 'sniff_auto' || l.type === 'sniff_manual'));
         if (sniffs.length === 0)
             return [];
-        // 緯度経度を小数第4位（約10mメッシュ）でグループ化
+        // 緯度経度を小数第4位（約10mメッシュ）でグループ化し、重心平均を算出
         const clusters = {};
         for (const log of sniffs) {
             const key = `${log.lat.toFixed(4)},${log.lng.toFixed(4)}`;
             if (!clusters[key]) {
-                clusters[key] = { lat: log.lat, lng: log.lng, totalSec: 0, count: 0 };
+                clusters[key] = { sumLat: 0, sumLng: 0, totalSec: 0, count: 0 };
             }
+            clusters[key].sumLat += log.lat;
+            clusters[key].sumLng += log.lng;
             clusters[key].totalSec += log.durationSec;
             clusters[key].count += 1;
         }
         return Object.values(clusters)
             .sort((a, b) => b.totalSec - a.totalSec)
-            .slice(0, 3);
+            .slice(0, 3)
+            .map((c) => ({
+            lat: c.sumLat / c.count,
+            lng: c.sumLng / c.count,
+            totalSec: c.totalSec,
+            count: c.count,
+        }));
     }, [filteredWalks]);
+    const rankedHeatmapSpots = useMemo(() => topSniffSpots.map((spot, idx) => ({
+        lat: spot.lat,
+        lng: spot.lng,
+        rank: (idx + 1),
+    })), [topSniffSpots]);
+    const handleFocusTopSpot = (spot) => {
+        setHeatmapFocusPoint((prev) => ({
+            lat: spot.lat,
+            lng: spot.lng,
+            key: (prev?.key ?? 0) + 1,
+        }));
+        heatmapMapContainerRef.current?.scrollIntoView({
+            behavior: 'smooth',
+            block: 'center',
+        });
+    };
     // サマリー・ヒートマップ表示用の安全な中心座標（自宅マスク外の実測ルート重心を優先）
     const summaryCenter = useMemo(() => {
         const pts = currentWalk?.routePoints || [];
@@ -4087,6 +4779,28 @@ function KunKatsuApp() {
         const previewUrl = URL.createObjectURL(blob);
         setShowShareModalUrl(previewUrl);
     };
+    const poopSelectorRemainingSec = Math.max(1, Math.ceil(poopSelectorRemainingMs / 1000));
+    const poopSelectorProgressPct = Math.max(0, Math.min(100, (poopSelectorRemainingMs / POOP_SELECTOR_WINDOW_MS) * 100));
+    const renderPoopConditionSelector = (isLockScreen) => {
+        if (!showPoopSelectorForId)
+            return null;
+        return (React.createElement("div", { className: isLockScreen
+                ? 'w-full p-3 bg-[#221E33] border border-purple-500/50 rounded-2xl flex flex-col gap-2 animate-fade-in'
+                : `p-3 rounded-2xl flex flex-col gap-2 ${theme.poopSelector}` },
+            React.createElement("div", { className: "flex items-center justify-between gap-2" },
+                React.createElement("span", { className: `text-xs font-bold flex items-center gap-1 ${isLockScreen ? 'text-[#F5EFE6]' : ''}` },
+                    React.createElement("span", null, "\uD83D\uDCA9"),
+                    " \u3046\u3093\u3061\u306E\u3088\u3046\u3059"),
+                React.createElement("span", { className: `text-[11px] tabular-nums font-semibold ${isLockScreen ? 'text-purple-300' : ''}` },
+                    "\u3042\u3068 ",
+                    poopSelectorRemainingSec,
+                    "\u79D2")),
+            React.createElement("div", { className: `w-full h-1.5 rounded-full overflow-hidden ${isLockScreen ? 'bg-[#151221]' : 'bg-black/10'}` },
+                React.createElement("div", { className: `h-full transition-[width] duration-100 ease-linear ${isLockScreen ? 'bg-purple-400' : 'bg-violet-500'}`, style: { width: `${poopSelectorProgressPct}%` } })),
+            React.createElement("div", { className: "grid grid-cols-3 gap-2" }, POOP_CONDITION_OPTIONS.map((opt) => (React.createElement("button", { key: opt.value, type: "button", onClick: () => handleSelectPoopCondition(opt.value), className: isLockScreen
+                    ? 'min-h-[52px] rounded-xl bg-[#312A48] hover:bg-[#3F365C] active:scale-95 border border-purple-400/50 text-sm font-bold text-[#F5EFE6] transition'
+                    : `min-h-[42px] px-2.5 py-1.5 text-xs rounded-xl font-bold active:scale-95 transition ${theme.poopChoiceBtn}` }, opt.label))))));
+    };
     return (React.createElement("main", { className: `min-h-screen ${theme.mainBg} pb-20 select-none` },
         React.createElement("label", { ref: iosHapticLabelRef, "aria-hidden": "true", className: "fixed -top-96 -left-96 w-px h-px opacity-0 pointer-events-none overflow-hidden" },
             React.createElement("input", { type: "checkbox", ...{ switch: '' }, tabIndex: -1 })),
@@ -4118,6 +4832,7 @@ function KunKatsuApp() {
                         React.createElement("span", null, "\u2705"),
                         " \u8A18\u9332\u5B8C\u4E86"),
                     React.createElement("button", { type: "button", onClick: handleUndoLastAction, className: "text-xs bg-[#3A3450] hover:bg-[#484163] active:scale-95 px-3 py-1 rounded text-amber-300 font-bold border border-[#484163]" }, "\u5143\u306B\u623B\u3059 (3\u79D2)"))),
+                renderPoopConditionSelector(true),
                 toastMessage && (React.createElement("div", { className: "w-full px-3 py-2 bg-neutral-900/90 border border-amber-600/50 rounded-xl text-center text-xs text-amber-300 animate-fade-in" }, toastMessage))),
             React.createElement("div", { className: "my-auto w-full max-w-xs flex flex-col items-center gap-2" },
                 React.createElement("div", { className: "grid grid-cols-3 gap-4 text-center w-full" },
@@ -4169,7 +4884,7 @@ function KunKatsuApp() {
                     React.createElement("span", { className: "text-[11px] font-medium block" }, "\uD83D\uDC43 \u30AF\u30F3\u6D3B"),
                     React.createElement("p", { className: "text-lg font-bold tabular-nums mt-0.5" }, formatTime(sniffTotalSec)))),
             React.createElement("div", { className: "h-64 w-full" },
-                React.createElement(DualMap, { engine: mapEngine, mapboxToken: profile?.mapboxPublicToken || '', darkMode: darkMode, centerLat: currentLat, centerLng: currentLng, routePoints: routePoints, actionLogs: actionLogs, activeLayer: "sniff" })),
+                React.createElement(DualMap, { engine: mapEngine, mapboxToken: profile?.mapboxPublicToken || '', darkMode: darkMode, centerLat: currentLat, centerLng: currentLng, routePoints: routePoints, actionLogs: actionLogs, encounters: encounters, activeLayer: "sniff" })),
             geofenceMaskedCount > 0 && (React.createElement("p", { className: `text-[11px] ${theme.textSecondary} text-center` },
                 "\uD83C\uDFE0 \u304A\u3046\u3061\u306E\u307E\u308F\u308A: ",
                 geofenceMaskedCount,
@@ -4186,12 +4901,7 @@ function KunKatsuApp() {
                 undoTargetId && (React.createElement("div", { className: `flex items-center justify-between p-2.5 rounded-2xl ${theme.undoBar}` },
                     React.createElement("span", { className: "text-xs" }, "\u304D\u308D\u304F\u3057\u307E\u3057\u305F"),
                     React.createElement("button", { onClick: handleUndoLastAction, className: `text-xs px-3 py-1.5 rounded-xl font-bold transition ${theme.undoBtn}` }, "\u5143\u306B\u623B\u3059 (3\u79D2)"))),
-                showPoopSelectorForId && (React.createElement("div", { className: `p-2.5 rounded-2xl flex items-center justify-between gap-2 ${theme.poopSelector}` },
-                    React.createElement("span", { className: "text-xs font-medium" }, "\u3046\u3093\u3061\u306E\u3088\u3046\u3059:"),
-                    React.createElement("div", { className: "flex gap-1.5" },
-                        React.createElement("button", { onClick: () => handleSelectPoopCondition('normal'), className: `px-2.5 py-1 text-xs rounded-xl font-medium transition ${theme.poopChoiceBtn}` }, "\u5FEB\u4FBF"),
-                        React.createElement("button", { onClick: () => handleSelectPoopCondition('soft'), className: `px-2.5 py-1 text-xs rounded-xl font-medium transition ${theme.poopChoiceBtn}` }, "\u8EDF\u4FBF"),
-                        React.createElement("button", { onClick: () => handleSelectPoopCondition('hard'), className: `px-2.5 py-1 text-xs rounded-xl font-medium transition ${theme.poopChoiceBtn}` }, "\u786C\u3081")))),
+                renderPoopConditionSelector(false),
                 React.createElement("button", { onClick: () => handleManualAction('sniff_manual'), className: `w-full py-4.5 rounded-2xl font-bold text-lg active:scale-95 transition flex items-center justify-center gap-2 ${theme.sniffBtn}` },
                     React.createElement("span", null, "\uD83D\uDC43"),
                     React.createElement("span", null, "\u30AF\u30F3\u6D3B\uFF01")),
@@ -4202,6 +4912,10 @@ function KunKatsuApp() {
                     React.createElement("button", { onClick: () => handleManualAction('poop'), className: `py-3.5 rounded-2xl font-bold text-base active:scale-95 transition flex items-center justify-center gap-1.5 ${theme.poopBtn}` },
                         React.createElement("span", null, "\uD83D\uDCA9"),
                         React.createElement("span", null, "\u3046\u3093\u3061"))),
+                React.createElement("button", { type: "button", onClick: handleRecordEncounter, className: `w-full min-h-[48px] py-3 rounded-2xl font-bold text-sm active:scale-95 transition flex items-center justify-center gap-2 ${theme.encounterBtn}` },
+                    React.createElement("span", null, "\uD83D\uDC15"),
+                    React.createElement("span", null, "\u3059\u308C\u9055\u3044\u30E1\u30E2"),
+                    encounters.length > 0 && (React.createElement("span", { className: `px-2 py-0.5 rounded-full text-xs font-extrabold tabular-nums ${darkMode ? 'bg-emerald-800/80 text-emerald-100' : 'bg-white/90 text-emerald-800'}` }, encounters.length))),
                 React.createElement("div", { className: `relative overflow-hidden rounded-2xl border mt-1 ${theme.stopBarWrap}` },
                     React.createElement("div", { className: `absolute inset-0 transition-all duration-75 pointer-events-none ${theme.stopBarFill}`, style: { width: `${stopHoldProgress}%` } }),
                     React.createElement("button", { onMouseDown: handleStopHoldStart, onMouseUp: handleStopHoldEnd, onTouchStart: handleStopHoldStart, onTouchEnd: handleStopHoldEnd, className: `relative w-full py-3.5 bg-transparent font-bold text-xs text-center transition-colors ${theme.stopBarText}` },
@@ -4238,7 +4952,9 @@ function KunKatsuApp() {
                     currentWalk.weather && (React.createElement("div", { className: `pt-1.5 border-t text-center text-[11px] font-medium tabular-nums truncate ${darkMode ? 'border-[#3A3450] text-[#B8AFA3]' : 'border-orange-100 text-stone-600'}` }, formatWalkWeatherBadge(currentWalk.weather)))),
                 React.createElement("div", { className: `p-4 rounded-3xl flex flex-col gap-3 ${theme.card}` },
                     React.createElement("div", { className: "h-64 w-full rounded-2xl overflow-hidden border border-orange-100/50" },
-                        React.createElement(DualMap, { engine: mapEngine, mapboxToken: profile?.mapboxPublicToken || '', darkMode: darkMode, centerLat: summaryCenter.lat, centerLng: summaryCenter.lng, routePoints: currentWalk.routePoints, actionLogs: currentWalk.actionLogs, activeLayer: "sniff" })),
+                        React.createElement(DualMap, { engine: mapEngine, mapboxToken: profile?.mapboxPublicToken || '', darkMode: darkMode, centerLat: summaryCenter.lat, centerLng: summaryCenter.lng, routePoints: currentWalk.routePoints, actionLogs: currentWalk.actionLogs, encounters: currentWalk.encounters, activeLayer: "sniff", showAllActionPoints: true, onActionTap: (logId) => setEditingActionLogId(logId), onEncounterTap: (encounterId) => setEditingSummaryEncounterId(encounterId) })),
+                    (currentWalk.actionLogs.length > 0 ||
+                        (currentWalk.encounters && currentWalk.encounters.length > 0)) && (React.createElement("p", { className: `text-[11px] text-center ${theme.textMuted}` }, "\uD83D\uDCA1 \u5730\u56F3\u4E0A\u306E\u4E38\u5370\u3092\u30BF\u30C3\u30D7\u3059\u308B\u3068\u78BA\u8A8D\u30FB\u7DE8\u96C6\u30FB\u524A\u9664\u304C\u3067\u304D\u307E\u3059\uFF08\u7DD1\u306F\u3059\u308C\u9055\u3044\uFF09")),
                     React.createElement("div", { className: "grid grid-cols-2 gap-2 text-xs" },
                         React.createElement("div", { className: `p-2.5 rounded-2xl border ${theme.statDistTile}` },
                             React.createElement("span", { className: "text-[11px] font-medium block" }, "\uD83D\uDC3E \u3042\u308B\u3044\u305F\u304D\u3087\u308A"),
@@ -4335,6 +5051,34 @@ function KunKatsuApp() {
                             : 'border-rose-200 bg-rose-50/70 text-rose-700 hover:bg-rose-100/80'}` }, "\uD83D\uDDD1\uFE0F \u3053\u306E\u304A\u3055\u3093\u307D\u8A18\u9332\u3092\u524A\u9664")))),
                 React.createElement("div", { className: `p-4 rounded-3xl flex flex-col gap-3 ${theme.card}` },
                     React.createElement("div", { className: "flex items-center justify-between gap-2" },
+                        React.createElement("h3", { className: `text-sm font-bold flex items-center gap-1.5 ${theme.textPrimary}` },
+                            React.createElement("span", null, "\uD83D\uDC15"),
+                            React.createElement("span", null,
+                                "\u3059\u308C\u9055\u3063\u305F\u308F\u3093\u3061\u3083\u3093\uFF08",
+                                (currentWalk.encounters ?? []).length,
+                                "\u4EF6\uFF09")),
+                        React.createElement("span", { className: `text-[10px] ${theme.textMuted}` }, "\uD83D\uDD12 \u30B7\u30A7\u30A2\u753B\u50CF\u306B\u306F\u8F09\u308A\u307E\u305B\u3093")),
+                    !currentWalk.encounters || currentWalk.encounters.length === 0 ? (React.createElement("p", { className: `text-xs ${theme.textSecondary}` }, "\u3053\u306E\u304A\u3055\u3093\u307D\u3067\u306F\u307E\u3060\u8A18\u9332\u304C\u3042\u308A\u307E\u305B\u3093\uFF08\u304A\u3055\u3093\u307D\u4E2D\u306E\u300C\uD83D\uDC15 \u3059\u308C\u9055\u3044\u30E1\u30E2\u300D\u304B\u3089\u6B8B\u305B\u307E\u3059\uFF09\u3002")) : (React.createElement("div", { className: "flex flex-col gap-2" }, currentWalk.encounters.map((enc) => {
+                        const hasName = Boolean(enc.name && enc.name.trim().length > 0);
+                        const timeStr = new Date(enc.timestamp).toLocaleTimeString('ja-JP', {
+                            hour: '2-digit',
+                            minute: '2-digit',
+                        });
+                        return (React.createElement("button", { key: enc.id, type: "button", onClick: () => setEditingSummaryEncounterId(enc.id), className: `w-full min-h-[48px] text-left p-3 rounded-2xl border flex items-start justify-between gap-3 active:scale-[0.99] transition ${theme.subCard}` },
+                            React.createElement("div", { className: "flex flex-col gap-1 min-w-0 flex-1" },
+                                React.createElement("div", { className: "flex items-center gap-2 flex-wrap" },
+                                    React.createElement("span", { className: `text-[11px] font-mono tabular-nums px-2 py-0.5 rounded-full border ${darkMode
+                                            ? 'bg-emerald-950/60 text-emerald-200 border-emerald-700/50'
+                                            : 'bg-emerald-50 text-emerald-800 border-emerald-200'}` }, timeStr),
+                                    React.createElement("span", { className: `text-xs font-bold truncate ${hasName ? theme.textPrimary : theme.textSecondary}` }, hasName ? enc.name : '名前未設定（タップして追記）'),
+                                    enc.breed && (React.createElement("span", { className: `text-[11px] px-2 py-0.5 rounded-full ${darkMode
+                                            ? 'bg-[#3A3450] text-[#E6DDD0]'
+                                            : 'bg-white text-stone-600 border border-orange-200'}` }, enc.breed))),
+                                enc.features ? (React.createElement("p", { className: `text-xs break-words ${theme.textSecondary}` }, enc.features)) : (React.createElement("p", { className: `text-[11px] ${theme.textMuted}` }, "\u7279\u5FB4\u30E1\u30E2\u306A\u3057"))),
+                            React.createElement("span", { className: `text-xs font-semibold shrink-0 px-2.5 py-1 rounded-xl ${theme.secondaryBtn}` }, "\u270F\uFE0F \u7DE8\u96C6")));
+                    })))),
+                React.createElement("div", { className: `p-4 rounded-3xl flex flex-col gap-3 ${theme.card}` },
+                    React.createElement("div", { className: "flex items-center justify-between gap-2" },
                         React.createElement("h3", { className: `text-sm font-bold ${theme.textPrimary}` },
                             "\uD83D\uDCDA \u3053\u308C\u307E\u3067\u306E\u304A\u3055\u3093\u307D\uFF08",
                             allWalks.length,
@@ -4396,24 +5140,27 @@ function KunKatsuApp() {
                 React.createElement("button", { onClick: () => setHeatmapLayer('sniff'), className: `py-1.5 rounded-xl transition-all ${heatmapLayer === 'sniff' ? theme.segmentActive : theme.segmentInactive}` }, "\uD83D\uDC43 \u30AF\u30F3\u6D3B"),
                 React.createElement("button", { onClick: () => setHeatmapLayer('excretion'), className: `py-1.5 rounded-xl transition-all ${heatmapLayer === 'excretion' ? theme.segmentActive : theme.segmentInactive}` }, "\uD83D\uDCA7 \u30C8\u30A4\u30EC"),
                 React.createElement("button", { onClick: () => setHeatmapLayer('route'), className: `py-1.5 rounded-xl transition-all ${heatmapLayer === 'route' ? theme.segmentActive : theme.segmentInactive}` }, "\uD83D\uDC63 \u3088\u304F\u901A\u308B\u9053")),
-            React.createElement("div", { className: "h-80 w-full rounded-2xl overflow-hidden border border-orange-100/50" },
-                React.createElement(DualMap, { engine: mapEngine, mapboxToken: profile?.mapboxPublicToken || '', darkMode: darkMode, centerLat: heatmapCenter.lat, centerLng: heatmapCenter.lng, routePoints: filteredWalks.flatMap((w) => w.routePoints), actionLogs: filteredWalks.flatMap((w) => w.actionLogs), activeLayer: heatmapLayer })),
+            React.createElement("div", { ref: heatmapMapContainerRef, className: "h-80 w-full rounded-2xl overflow-hidden border border-orange-100/50" },
+                React.createElement(DualMap, { engine: mapEngine, mapboxToken: profile?.mapboxPublicToken || '', darkMode: darkMode, centerLat: heatmapCenter.lat, centerLng: heatmapCenter.lng, routePoints: filteredWalks.flatMap((w) => w.routePoints), actionLogs: filteredWalks.flatMap((w) => w.actionLogs), activeLayer: heatmapLayer, rankedSpots: rankedHeatmapSpots, focusPoint: heatmapFocusPoint })),
             React.createElement("div", { className: `p-3.5 rounded-2xl border ${theme.card} text-xs` },
-                React.createElement("span", { className: `font-bold block ${theme.textPrimary}` }, "\uD83D\uDCA1 \u304A\u6C17\u306B\u5165\u308A\u30AF\u30F3\u6D3B\u30B9\u30DD\u30C3\u30C8 Top3"),
+                React.createElement("div", { className: "flex items-center justify-between gap-2" },
+                    React.createElement("span", { className: `font-bold block ${theme.textPrimary}` }, "\uD83D\uDCA1 \u304A\u6C17\u306B\u5165\u308A\u30AF\u30F3\u6D3B\u30B9\u30DD\u30C3\u30C8 Top3"),
+                    topSniffSpots.length > 0 && (React.createElement("span", { className: `text-[10px] ${theme.textMuted}` }, "\u30BF\u30C3\u30D7\u3067\u5730\u56F3\u30BA\u30FC\u30E0"))),
                 topSniffSpots.length > 0 ? (React.createElement("ol", { className: "mt-2 flex flex-col gap-1.5" }, topSniffSpots.map((spot, idx) => {
                     const medal = idx === 0 ? '🥇' : idx === 1 ? '🥈' : idx === 2 ? '🥉' : `${idx + 1}.`;
-                    return (React.createElement("li", { key: idx, className: `flex items-center justify-between p-2 rounded-xl border ${theme.subCard}` },
-                        React.createElement("div", { className: "flex items-center gap-2" },
-                            React.createElement("span", { className: "text-base" }, medal),
-                            React.createElement("span", { className: `font-medium ${theme.textPrimary}` },
-                                "\u5730\u70B9 #",
-                                idx + 1)),
-                        React.createElement("span", { className: `text-[11px] tabular-nums ${theme.textSecondary}` },
-                            "\u6EDE\u5728 ",
-                            formatTime(spot.totalSec),
-                            " / ",
-                            spot.count,
-                            "\u56DE")));
+                    return (React.createElement("li", { key: `${idx}-${spot.lat.toFixed(5)}-${spot.lng.toFixed(5)}` },
+                        React.createElement("button", { type: "button", onClick: () => handleFocusTopSpot(spot), className: `w-full flex items-center justify-between p-2 rounded-xl border ${theme.subCard} active:scale-[0.98] transition text-left cursor-pointer` },
+                            React.createElement("div", { className: "flex items-center gap-2" },
+                                React.createElement("span", { className: "text-base" }, medal),
+                                React.createElement("span", { className: `font-medium ${theme.textPrimary}` },
+                                    "\u5730\u70B9 #",
+                                    idx + 1)),
+                            React.createElement("span", { className: `text-[11px] tabular-nums ${theme.textSecondary}` },
+                                "\u6EDE\u5728 ",
+                                formatTime(spot.totalSec),
+                                " / ",
+                                spot.count,
+                                "\u56DE \uD83D\uDD0D"))));
                 }))) : (React.createElement("p", { className: `text-[11px] mt-1 ${theme.textMuted}` }, "\u304A\u3055\u3093\u307D\u8A18\u9332\u304C\u5897\u3048\u308B\u3068\u3001\u3088\u304F\u7ACB\u3061\u5BC4\u308B\u5834\u6240\u304C\u81EA\u52D5\u3067\u30E9\u30F3\u30AD\u30F3\u30B0\u3055\u308C\u307E\u3059\u3002"))))),
         activeTab === 'stats' && (React.createElement(StatsDashboard, { walks: allWalks, darkMode: darkMode, onSelectWalk: (walkId) => {
                 selectWalk(walkId);
@@ -4566,6 +5313,23 @@ function KunKatsuApp() {
                         URL.revokeObjectURL(showShareModalUrl);
                         setShowShareModalUrl(null);
                     }, className: `w-full py-2.5 rounded-full text-xs font-bold active:scale-95 transition mt-1 ${theme.secondaryBtn}` }, "\u3068\u3058\u308B")))),
+        activeTab === 'summary' && editingActionLog && (React.createElement(MapPointEditSheet, { key: editingActionLog.id, log: editingActionLog, darkMode: darkMode, isSaving: isSavingActionEdit, onClose: () => setEditingActionLogId(null), onUpdatePoopCondition: (logId, condition) => {
+                void handleUpdateActionPoopCondition(logId, condition);
+            }, onDelete: (logId) => {
+                void handleDeleteActionLog(logId);
+            } })),
+        isWalking && activeWalkEncounter && (React.createElement(EncounterQuickSheet, { key: `walk_${activeWalkEncounter.id}`, encounter: activeWalkEncounter, mode: "walk", darkMode: darkMode, onSave: handleSaveActiveWalkEncounter, onSkip: () => {
+                setActiveWalkEncounterId(null);
+                showToast('📍 場所だけ残しました（あとでふりかえりから追記できます）');
+            }, onClose: () => {
+                setActiveWalkEncounterId(null);
+                showToast('📍 場所だけ残しました（あとでふりかえりから追記できます）');
+            } })),
+        activeTab === 'summary' && editingSummaryEncounter && (React.createElement(EncounterQuickSheet, { key: `summary_${editingSummaryEncounter.id}`, encounter: editingSummaryEncounter, mode: "summary", darkMode: darkMode, isSaving: isSavingEncounterEdit, onSave: (encounterId, patch) => {
+                void handleUpdateSummaryEncounter(encounterId, patch);
+            }, onDelete: (encounterId) => {
+                void handleDeleteSummaryEncounter(encounterId);
+            }, onClose: () => setEditingSummaryEncounterId(null) })),
         React.createElement("nav", { className: `fixed bottom-0 inset-x-0 ${theme.nav} border-t backdrop-blur flex justify-around items-center py-2 px-1.5 gap-0.5 z-40` },
             React.createElement("button", { onClick: () => switchTab('walk'), className: `flex-1 min-w-0 flex flex-col items-center justify-center py-1 px-1 rounded-full text-xs transition-all whitespace-nowrap ${activeTab === 'walk' ? theme.navItemActive : theme.navItemInactive}` },
                 React.createElement("span", { className: "text-base leading-none" }, "\uD83D\uDC3E"),
