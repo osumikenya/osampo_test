@@ -195,7 +195,14 @@ async function getDogProfile() {
         const req = store.get('default_dog');
         req.onsuccess = () => {
             if (req.result) {
-                resolve(req.result);
+                const stored = req.result;
+                const normalizedStaleDays = typeof stored.staleRouteDays === 'number' && Number.isFinite(stored.staleRouteDays)
+                    ? Math.min(60, Math.max(3, Math.round(stored.staleRouteDays)))
+                    : 14;
+                resolve({
+                    ...stored,
+                    staleRouteDays: normalizedStaleDays,
+                });
             }
             else {
                 const defaultProfile = {
@@ -210,6 +217,7 @@ async function getDogProfile() {
                     geofenceRadiusMeters: 200, // 確定仕様: 初期値200m (下限150m)
                     mapboxPublicToken: '',
                     soundFeedbackEnabled: false,
+                    staleRouteDays: 14,
                 };
                 resolve(defaultProfile);
             }
@@ -1167,6 +1175,261 @@ function calculateWalkStats(walks, period, nowMs = Date.now()) {
 }
 
 
+// --- routeFreshness.ts ---
+/** 約30m四方のグリッド幅（度換算: 緯度約33m・中緯度経度約27m） */
+const ROUTE_FRESHNESS_GRID_DEG = 0.0003;
+/** コース同一視のJaccard類似度しきい値（50%以上重複で同一コース扱い） */
+const ROUTE_FRESHNESS_JACCARD_THRESHOLD = 0.5;
+/** ごぶさた提案を行うための最小有効散歩件数 */
+const ROUTE_FRESHNESS_MIN_VALID_WALKS = 3;
+/** ごぶさたコース提案の最大抽出件数 */
+const ROUTE_FRESHNESS_MAX_SUGGESTIONS = 3;
+/** ごぶさた判定日数のデフォルト・下限・上限（D4合意: 初期値14日、範囲3〜60日） */
+const ROUTE_FRESHNESS_DEFAULT_STALE_DAYS = 14;
+const ROUTE_FRESHNESS_MIN_STALE_DAYS = 3;
+const ROUTE_FRESHNESS_MAX_STALE_DAYS = 60;
+/** 1日あたりのミリ秒 */
+const ROUTE_FRESHNESS_DAY_MS = 24 * 60 * 60 * 1000;
+/** ごぶさた判定日数を 3〜60 日の安全な整数に丸める */
+function clampRouteFreshnessStaleDays(value) {
+    if (typeof value !== 'number' || !Number.isFinite(value)) {
+        return ROUTE_FRESHNESS_DEFAULT_STALE_DAYS;
+    }
+    const rounded = Math.round(value);
+    return Math.min(ROUTE_FRESHNESS_MAX_STALE_DAYS, Math.max(ROUTE_FRESHNESS_MIN_STALE_DAYS, rounded));
+}
+/** 緯度・経度を約30mメッシュのセルキー（"latIdx:lngIdx"）に変換する */
+function toRouteFreshnessCellKey(lat, lng) {
+    const latIdx = Math.round(lat / ROUTE_FRESHNESS_GRID_DEG);
+    const lngIdx = Math.round(lng / ROUTE_FRESHNESS_GRID_DEG);
+    return `${latIdx}:${lngIdx}`;
+}
+/** 2つのセル集合のJaccard類似度（|A ∩ B| / |A ∪ B|）を計算する */
+function computeRouteFreshnessJaccard(setA, setB) {
+    if (setA.size === 0 || setB.size === 0) {
+        return 0;
+    }
+    const [smaller, larger] = setA.size <= setB.size ? [setA, setB] : [setB, setA];
+    let intersection = 0;
+    for (const key of smaller) {
+        if (larger.has(key)) {
+            intersection += 1;
+        }
+    }
+    const union = setA.size + setB.size - intersection;
+    return union > 0 ? intersection / union : 0;
+}
+/**
+ * 過去の散歩ログ配列から約30mメッシュ鮮度と「ごぶさたコース」上位3件を純関数で算出する（タスク 3.1）
+ * - 外部通信は一切行わない
+ * - getWalkExclusionReason 対象および demo_ プレフィックスの散歩は除外
+ * - 有効な散歩が3件未満の場合は courses / suggestions を空配列として返す
+ */
+function calculateRouteFreshness(walks, staleDaysOrOptions = ROUTE_FRESHNESS_DEFAULT_STALE_DAYS, nowMsArg) {
+    const rawStaleDays = typeof staleDaysOrOptions === 'number'
+        ? staleDaysOrOptions
+        : staleDaysOrOptions?.staleDays;
+    const staleDays = clampRouteFreshnessStaleDays(rawStaleDays);
+    const rawNowMs = typeof nowMsArg === 'number'
+        ? nowMsArg
+        : typeof staleDaysOrOptions === 'object' && staleDaysOrOptions !== null
+            ? staleDaysOrOptions.nowMs
+            : undefined;
+    const nowMs = typeof rawNowMs === 'number' && Number.isFinite(rawNowMs) ? rawNowMs : Date.now();
+    if (!Array.isArray(walks) || walks.length === 0) {
+        return {
+            hasEnoughData: false,
+            validWalkCount: 0,
+            staleDays,
+            courses: [],
+            suggestions: [],
+            allCourses: [],
+            cells: [],
+        };
+    }
+    // 1. 除外判定（getWalkExclusionReason + demo_ + ルート点検証）とセル集合の構築
+    const validEntries = [];
+    const cellMap = new Map();
+    for (const walk of walks) {
+        if (!walk || typeof walk.id !== 'string' || walk.id.startsWith('demo_')) {
+            continue;
+        }
+        if (getWalkExclusionReason(walk) !== null) {
+            continue;
+        }
+        if (!Number.isFinite(walk.startTime) || !Array.isArray(walk.routePoints)) {
+            continue;
+        }
+        const validPoints = walk.routePoints.filter((p) => p && Number.isFinite(p.lat) && Number.isFinite(p.lng));
+        if (validPoints.length === 0) {
+            continue;
+        }
+        const cellSet = new Set();
+        for (const pt of validPoints) {
+            const latIdx = Math.round(pt.lat / ROUTE_FRESHNESS_GRID_DEG);
+            const lngIdx = Math.round(pt.lng / ROUTE_FRESHNESS_GRID_DEG);
+            const key = `${latIdx}:${lngIdx}`;
+            const isFirstPointInWalkForCell = !cellSet.has(key);
+            cellSet.add(key);
+            let acc = cellMap.get(key);
+            if (!acc) {
+                acc = {
+                    key,
+                    gridLat: Number((latIdx * ROUTE_FRESHNESS_GRID_DEG).toFixed(6)),
+                    gridLng: Number((lngIdx * ROUTE_FRESHNESS_GRID_DEG).toFixed(6)),
+                    sumLat: 0,
+                    sumLng: 0,
+                    pointCount: 0,
+                    lastVisitedAt: walk.startTime,
+                    visitWalkCount: 0,
+                };
+                cellMap.set(key, acc);
+            }
+            acc.sumLat += pt.lat;
+            acc.sumLng += pt.lng;
+            acc.pointCount += 1;
+            if (walk.startTime > acc.lastVisitedAt) {
+                acc.lastVisitedAt = walk.startTime;
+            }
+            if (isFirstPointInWalkForCell) {
+                acc.visitWalkCount += 1;
+            }
+        }
+        if (cellSet.size > 0) {
+            validEntries.push({ walk, validPoints, cellSet });
+        }
+    }
+    // セル別鮮度データの整形（経過日数の降順 → キー昇順）
+    const cells = Array.from(cellMap.values())
+        .map((acc) => {
+        const elapsedMs = Math.max(0, nowMs - acc.lastVisitedAt);
+        const daysSinceLastVisit = Math.floor(elapsedMs / ROUTE_FRESHNESS_DAY_MS);
+        const isStale = daysSinceLastVisit >= staleDays;
+        const freshnessScore = Math.min(1, Math.max(0, daysSinceLastVisit / Math.max(1, staleDays)));
+        return {
+            key: acc.key,
+            lat: acc.pointCount > 0 ? acc.sumLat / acc.pointCount : acc.gridLat,
+            lng: acc.pointCount > 0 ? acc.sumLng / acc.pointCount : acc.gridLng,
+            gridLat: acc.gridLat,
+            gridLng: acc.gridLng,
+            lastVisitedAt: acc.lastVisitedAt,
+            daysSinceLastVisit,
+            visitWalkCount: acc.visitWalkCount,
+            isStale,
+            freshnessScore,
+        };
+    })
+        .sort((a, b) => {
+        if (b.daysSinceLastVisit !== a.daysSinceLastVisit) {
+            return b.daysSinceLastVisit - a.daysSinceLastVisit;
+        }
+        if (a.lastVisitedAt !== b.lastVisitedAt) {
+            return a.lastVisitedAt - b.lastVisitedAt;
+        }
+        return a.key.localeCompare(b.key);
+    });
+    const validWalkCount = validEntries.length;
+    const hasEnoughData = validWalkCount >= ROUTE_FRESHNESS_MIN_VALID_WALKS;
+    // 有効な散歩が3件未満の場合は提案リストを空として返す
+    if (!hasEnoughData) {
+        return {
+            hasEnoughData: false,
+            validWalkCount,
+            staleDays,
+            courses: [],
+            suggestions: [],
+            allCourses: [],
+            cells,
+        };
+    }
+    // 2. 新しい散歩順（startTime 降順）に並べて Jaccard >= 0.5 で貪欲クラスタリング
+    const sortedEntries = [...validEntries].sort((a, b) => {
+        if (b.walk.startTime !== a.walk.startTime) {
+            return b.walk.startTime - a.walk.startTime;
+        }
+        return a.walk.id.localeCompare(b.walk.id);
+    });
+    const clusters = [];
+    for (const entry of sortedEntries) {
+        let bestCluster = null;
+        let bestSim = -1;
+        for (const cluster of clusters) {
+            const sim = computeRouteFreshnessJaccard(entry.cellSet, cluster.representativeCells);
+            if (sim >= ROUTE_FRESHNESS_JACCARD_THRESHOLD && sim > bestSim) {
+                bestSim = sim;
+                bestCluster = cluster;
+            }
+        }
+        if (bestCluster) {
+            bestCluster.walks.push(entry.walk);
+            if (entry.walk.startTime > bestCluster.lastWalkedAt) {
+                bestCluster.lastWalkedAt = entry.walk.startTime;
+                bestCluster.representativeWalk = entry.walk;
+                bestCluster.representativePoints = entry.validPoints;
+                bestCluster.representativeCells = entry.cellSet;
+            }
+        }
+        else {
+            clusters.push({
+                representativeWalk: entry.walk,
+                representativePoints: entry.validPoints,
+                representativeCells: entry.cellSet,
+                walks: [entry.walk],
+                lastWalkedAt: entry.walk.startTime,
+            });
+        }
+    }
+    // 3. クラスタをコース情報に変換し、最終歩行からの経過日数順（古い順 = ごぶさた順）でソート
+    const allCourses = clusters
+        .map((cluster) => {
+        const pts = cluster.representativePoints;
+        const sumLat = pts.reduce((acc, p) => acc + p.lat, 0);
+        const sumLng = pts.reduce((acc, p) => acc + p.lng, 0);
+        const centerLat = pts.length > 0 ? sumLat / pts.length : 0;
+        const centerLng = pts.length > 0 ? sumLng / pts.length : 0;
+        const elapsedMs = Math.max(0, nowMs - cluster.lastWalkedAt);
+        const daysSinceLastWalk = Math.floor(elapsedMs / ROUTE_FRESHNESS_DAY_MS);
+        const isStale = daysSinceLastWalk >= staleDays;
+        return {
+            clusterId: `course_${cluster.representativeWalk.id}`,
+            representativeWalkId: cluster.representativeWalk.id,
+            lastWalkedAt: cluster.lastWalkedAt,
+            daysSinceLastWalk,
+            distanceMeters: Math.round(cluster.representativeWalk.distanceMeters),
+            durationSec: Math.round(cluster.representativeWalk.durationSec),
+            routePoints: pts,
+            centerLat,
+            centerLng,
+            walkCount: cluster.walks.length,
+            cellCount: cluster.representativeCells.size,
+            isStale,
+        };
+    })
+        .sort((a, b) => {
+        if (b.daysSinceLastWalk !== a.daysSinceLastWalk) {
+            return b.daysSinceLastWalk - a.daysSinceLastWalk;
+        }
+        if (a.lastWalkedAt !== b.lastWalkedAt) {
+            return a.lastWalkedAt - b.lastWalkedAt;
+        }
+        return a.representativeWalkId.localeCompare(b.representativeWalkId);
+    });
+    // 4. ごぶさた判定（isStale === true）を満たす上位3コースを抽出
+    const courses = allCourses
+        .filter((course) => course.isStale)
+        .slice(0, ROUTE_FRESHNESS_MAX_SUGGESTIONS);
+    return {
+        hasEnoughData: true,
+        validWalkCount,
+        staleDays,
+        courses,
+        suggestions: courses,
+        allCourses,
+        cells,
+    };
+}
+
+
 // --- weather.ts ---
 /**
  * 散歩前「おさんぽ天気チェック」用の天気取得・座標丸め・WMOコード変換モジュール
@@ -1909,7 +2172,7 @@ function syncDualMapRankedMarkers(map, spots, useMapbox, isDarkMode, markersRef)
     }
     markersRef.current = nextMarkers;
 }
-function DualMap({ engine, mapboxToken, darkMode, centerLat, centerLng, routePoints, actionLogs, activeLayer, rankedSpots, focusPoint, onActionTap, showAllActionPoints = false, encounters, onEncounterTap, }) {
+function DualMap({ engine, mapboxToken, darkMode, centerLat, centerLng, routePoints, actionLogs, activeLayer, rankedSpots, focusPoint, onActionTap, showAllActionPoints = false, encounters, onEncounterTap, freshnessCells, suggestedRoutePoints, }) {
     const containerRef = useRef(null);
     const mapInstanceRef = useRef(null);
     const isLoadedRef = useRef(false);
@@ -1933,6 +2196,8 @@ function DualMap({ engine, mapboxToken, darkMode, centerLat, centerLng, routePoi
         rankedSpots,
         showAllActionPoints,
         encounters,
+        freshnessCells,
+        suggestedRoutePoints,
     });
     latestPropsRef.current = {
         routePoints,
@@ -1941,6 +2206,8 @@ function DualMap({ engine, mapboxToken, darkMode, centerLat, centerLng, routePoi
         rankedSpots,
         showAllActionPoints,
         encounters,
+        freshnessCells,
+        suggestedRoutePoints,
     };
     // GeoJSON生成ヘルパー
     const createRouteGeoJson = (pts) => ({
@@ -1957,12 +2224,37 @@ function DualMap({ engine, mapboxToken, darkMode, centerLat, centerLng, routePoi
             ]
             : [],
     });
+    const createFreshnessGeoJson = (cells = [], layer) => ({
+        type: 'FeatureCollection',
+        features: layer === 'freshness'
+            ? cells
+                .filter((cell) => Number.isFinite(cell.lat) &&
+                Number.isFinite(cell.lng) &&
+                Number.isFinite(cell.daysSinceLastVisit))
+                .map((cell) => ({
+                type: 'Feature',
+                properties: {
+                    key: cell.key,
+                    daysSinceLastVisit: cell.daysSinceLastVisit,
+                    visitWalkCount: cell.visitWalkCount,
+                    isStale: cell.isStale ? 1 : 0,
+                    freshnessScore: cell.freshnessScore,
+                },
+                geometry: {
+                    type: 'Point',
+                    coordinates: [cell.lng, cell.lat],
+                },
+            }))
+            : [],
+    });
     const createPointsGeoJson = (logs, layer, includeAll = false) => ({
         type: 'FeatureCollection',
         features: logs
             .filter((log) => {
             if (includeAll)
                 return true;
+            if (layer === 'freshness')
+                return false;
             if (layer === 'sniff')
                 return log.type === 'sniff_auto' || log.type === 'sniff_manual';
             if (layer === 'excretion')
@@ -2075,7 +2367,7 @@ function DualMap({ engine, mapboxToken, darkMode, centerLat, centerLng, routePoi
         map.on('load', () => {
             isLoadedRef.current = true;
             map.resize();
-            const { routePoints: currentRoutes, actionLogs: currentLogs, activeLayer: currentLayer, showAllActionPoints: currentIncludeAll, encounters: currentEncounters, } = latestPropsRef.current;
+            const { routePoints: currentRoutes, actionLogs: currentLogs, activeLayer: currentLayer, showAllActionPoints: currentIncludeAll, encounters: currentEncounters, freshnessCells: currentFreshnessCells, suggestedRoutePoints: currentSuggestedRoutes, } = latestPropsRef.current;
             // ルート軌跡ソース＆レイヤー
             map.addSource('walk-route', {
                 type: 'geojson',
@@ -2092,7 +2384,113 @@ function DualMap({ engine, mapboxToken, darkMode, centerLat, centerLng, routePoi
                 paint: {
                     'line-color': currentLayer === 'route' ? '#0d9488' : '#F0653A',
                     'line-width': currentLayer === 'route' ? 7 : 4,
+                    'line-opacity': currentLayer === 'freshness' ? 0.35 : 0.85,
+                },
+            });
+            // ごぶさた提案コースのプレビュー軌跡ソース＆レイヤー
+            map.addSource('suggested-route', {
+                type: 'geojson',
+                data: createRouteGeoJson(currentSuggestedRoutes ?? []),
+            });
+            map.addLayer({
+                id: 'suggested-route-line-casing',
+                type: 'line',
+                source: 'suggested-route',
+                layout: {
+                    'line-join': 'round',
+                    'line-cap': 'round',
+                },
+                paint: {
+                    'line-color': '#ffffff',
+                    'line-width': 9,
                     'line-opacity': 0.85,
+                },
+            });
+            map.addLayer({
+                id: 'suggested-route-line',
+                type: 'line',
+                source: 'suggested-route',
+                layout: {
+                    'line-join': 'round',
+                    'line-cap': 'round',
+                },
+                paint: {
+                    'line-color': '#0284c7',
+                    'line-width': 5,
+                    'line-dasharray': [2, 1.5],
+                    'line-opacity': 0.95,
+                },
+            });
+            // ごぶさた（鮮度）グリッドセルソース＆レイヤー（暖色＝最近歩いた道、寒色＝ごぶさたの道）
+            map.addSource('freshness-cells', {
+                type: 'geojson',
+                data: createFreshnessGeoJson(currentFreshnessCells, currentLayer),
+            });
+            map.addLayer({
+                id: 'freshness-cell-glow',
+                type: 'circle',
+                source: 'freshness-cells',
+                paint: {
+                    'circle-radius': [
+                        'interpolate',
+                        ['linear'],
+                        ['zoom'],
+                        13,
+                        8,
+                        15.5,
+                        15,
+                        18,
+                        24,
+                    ],
+                    'circle-color': [
+                        'interpolate',
+                        ['linear'],
+                        ['get', 'freshnessScore'],
+                        0,
+                        '#2563eb',
+                        0.35,
+                        '#06b6d4',
+                        0.65,
+                        '#f59e0b',
+                        1,
+                        '#ef4444',
+                    ],
+                    'circle-opacity': 0.28,
+                    'circle-blur': 0.65,
+                },
+            });
+            map.addLayer({
+                id: 'freshness-cell-circles',
+                type: 'circle',
+                source: 'freshness-cells',
+                paint: {
+                    'circle-radius': [
+                        'interpolate',
+                        ['linear'],
+                        ['zoom'],
+                        13,
+                        4.5,
+                        15.5,
+                        8.5,
+                        18,
+                        13,
+                    ],
+                    'circle-color': [
+                        'interpolate',
+                        ['linear'],
+                        ['get', 'freshnessScore'],
+                        0,
+                        '#1d4ed8',
+                        0.35,
+                        '#0284c7',
+                        0.65,
+                        '#f97316',
+                        1,
+                        '#ef4444',
+                    ],
+                    'circle-opacity': 0.85,
+                    'circle-stroke-width': 1.5,
+                    'circle-stroke-color': '#ffffff',
                 },
             });
             // アクションポイント（クン活・排泄）ソース＆ヒートマップ
@@ -2262,6 +2660,14 @@ function DualMap({ engine, mapboxToken, darkMode, centerLat, centerLng, routePoi
         if (routeSource) {
             routeSource.setData(createRouteGeoJson(routePoints));
         }
+        const suggestedSource = map.getSource('suggested-route');
+        if (suggestedSource) {
+            suggestedSource.setData(createRouteGeoJson(suggestedRoutePoints ?? []));
+        }
+        const freshnessSource = map.getSource('freshness-cells');
+        if (freshnessSource) {
+            freshnessSource.setData(createFreshnessGeoJson(freshnessCells, activeLayer));
+        }
         const actionSource = map.getSource('action-points');
         if (actionSource) {
             actionSource.setData(createPointsGeoJson(actionLogs, activeLayer, showAllActionPoints));
@@ -2273,8 +2679,17 @@ function DualMap({ engine, mapboxToken, darkMode, centerLat, centerLng, routePoi
         if (map.getLayer('walk-route-line')) {
             map.setPaintProperty('walk-route-line', 'line-color', activeLayer === 'route' ? '#0d9488' : '#F0653A');
             map.setPaintProperty('walk-route-line', 'line-width', activeLayer === 'route' ? 7 : 4);
+            map.setPaintProperty('walk-route-line', 'line-opacity', activeLayer === 'freshness' ? 0.35 : 0.85);
         }
-    }, [routePoints, actionLogs, activeLayer, showAllActionPoints, encounters]);
+    }, [
+        routePoints,
+        actionLogs,
+        activeLayer,
+        showAllActionPoints,
+        encounters,
+        freshnessCells,
+        suggestedRoutePoints,
+    ]);
     // 4. Top3クン活スポットの🥇🥈🥉ピン描画・クリーンアップ
     useEffect(() => {
         if (!mapInstanceRef.current || !isLoadedRef.current)
@@ -3468,6 +3883,29 @@ const MAP_POINT_EDIT_TYPE_META = {
         badgeLight: 'bg-purple-50 text-purple-900 border-purple-200',
     },
 };
+const MAP_POINT_EDIT_CHANGE_TYPE_OPTIONS = [
+    {
+        type: 'sniff_manual',
+        emoji: '👃',
+        label: 'クン活',
+        activeDark: 'bg-amber-600 text-white border-amber-400 shadow-sm',
+        activeLight: 'bg-amber-600 text-white border-amber-700 shadow-sm',
+    },
+    {
+        type: 'pee',
+        emoji: '💧',
+        label: 'おしっこ',
+        activeDark: 'bg-sky-600 text-white border-sky-400 shadow-sm',
+        activeLight: 'bg-sky-600 text-white border-sky-700 shadow-sm',
+    },
+    {
+        type: 'poop',
+        emoji: '💩',
+        label: 'うんち',
+        activeDark: 'bg-purple-600 text-white border-purple-400 shadow-sm',
+        activeLight: 'bg-purple-600 text-white border-purple-700 shadow-sm',
+    },
+];
 const MAP_POINT_EDIT_POOP_OPTIONS = [
     { value: 'normal', label: '快便' },
     { value: 'soft', label: '軟便' },
@@ -3481,7 +3919,7 @@ function mapPointEditFormatTimestamp(timestamp) {
     const second = String(date.getSeconds()).padStart(2, '0');
     return `${hour}:${minute}:${second}`;
 }
-function MapPointEditSheet({ log, darkMode, isSaving = false, onClose, onUpdatePoopCondition, onDelete, }) {
+function MapPointEditSheet({ log, darkMode, isSaving = false, onClose, onChangeType, onUpdatePoopCondition, onDelete, }) {
     const [confirmingDelete, setConfirmingDelete] = useState(false);
     if (!log)
         return null;
@@ -3508,6 +3946,24 @@ function MapPointEditSheet({ log, darkMode, isSaving = false, onClose, onUpdateP
                 React.createElement("button", { type: "button", onClick: onClose, "aria-label": "\u9589\u3058\u308B", className: `w-9 h-9 rounded-full flex items-center justify-center text-sm font-bold transition active:scale-95 ${darkMode
                         ? 'bg-[#3A3450] text-[#F5EFE6] hover:bg-[#484163]'
                         : 'bg-orange-50 text-stone-600 hover:bg-orange-100'}` }, "\u2715")),
+            React.createElement("div", { className: `p-3 rounded-2xl border flex flex-col gap-2 ${darkMode
+                    ? 'bg-[#1C1A27]/70 border-[#3A3450]'
+                    : 'bg-orange-50/50 border-orange-200/80'}` },
+                React.createElement("p", { className: `text-xs font-bold ${darkMode ? 'text-[#F5EFE6]' : 'text-stone-700'}` }, "\uD83D\uDD04 \u7A2E\u985E\u3092\u5909\u66F4"),
+                React.createElement("div", { className: "grid grid-cols-3 gap-2" }, MAP_POINT_EDIT_CHANGE_TYPE_OPTIONS.map((opt) => {
+                    const isCurrent = opt.type === 'sniff_manual' ? isSniff : log.type === opt.type;
+                    return (React.createElement("button", { key: opt.type, type: "button", disabled: isSaving || isCurrent || !onChangeType, onClick: () => {
+                            if (!isCurrent && onChangeType) {
+                                onChangeType(log.id, opt.type);
+                            }
+                        }, className: `min-h-[44px] px-2 py-2 rounded-xl text-xs font-bold border transition flex items-center justify-center gap-1 ${isSaving ? 'opacity-50' : ''} ${isCurrent
+                            ? `${darkMode ? opt.activeDark : opt.activeLight} cursor-default`
+                            : darkMode
+                                ? 'bg-[#28243A] text-[#F5EFE6] border-[#4E4768] hover:bg-[#3A3450] active:scale-95 disabled:opacity-50'
+                                : 'bg-white text-stone-700 border-orange-200 hover:bg-orange-50 active:scale-95 disabled:opacity-50'}` },
+                        React.createElement("span", null, opt.emoji),
+                        React.createElement("span", null, opt.label)));
+                }))),
             log.type === 'poop' && (React.createElement("div", { className: `p-3 rounded-2xl border flex flex-col gap-2 ${darkMode
                     ? 'bg-[#1C1A27]/70 border-[#3A3450]'
                     : 'bg-purple-50/50 border-purple-200/80'}` },
@@ -3797,9 +4253,13 @@ function KunKatsuApp() {
     const [periodFilter, setPeriodFilter] = useState('all');
     const [heatmapFocusPoint, setHeatmapFocusPoint] = useState(null);
     const heatmapMapContainerRef = useRef(null);
+    const walkMapContainerRef = useRef(null);
+    const [selectedSuggestedClusterId, setSelectedSuggestedClusterId] = useState(null);
+    const [walkSuggestedFocusPoint, setWalkSuggestedFocusPoint] = useState(null);
     const [dogWeightDraft, setDogWeightDraft] = useState('28');
     const [ownerWeightDraft, setOwnerWeightDraft] = useState('65');
     const [geofenceRadiusDraft, setGeofenceRadiusDraft] = useState('200');
+    const [staleRouteDaysDraft, setStaleRouteDaysDraft] = useState(String(ROUTE_FRESHNESS_DEFAULT_STALE_DAYS));
     const [toastMessage, setToastMessage] = useState(null);
     const toastTimeoutRef = useRef(null);
     const [lockFlashColor, setLockFlashColor] = useState(null);
@@ -3908,6 +4368,7 @@ function KunKatsuApp() {
             setDogWeightDraft(String(loadedProfile.weightKg));
             setOwnerWeightDraft(String(loadedProfile.ownerWeightKg));
             setGeofenceRadiusDraft(String(loadedProfile.geofenceRadiusMeters));
+            setStaleRouteDaysDraft(String(loadedProfile.staleRouteDays ?? ROUTE_FRESHNESS_DEFAULT_STALE_DAYS));
             const walks = await getAllWalks();
             setAllWalks(walks);
             if (walks.length > 0)
@@ -4321,6 +4782,8 @@ function KunKatsuApp() {
         setTotalInterruptedSec(0);
         setLastGpsReceivedAt(null);
         setSecondsSinceLastGps(0);
+        setSelectedSuggestedClusterId(null);
+        setWalkSuggestedFocusPoint(null);
         setIsSimulating(withSimulator);
         setIsWalking(true);
     };
@@ -4418,7 +4881,7 @@ function KunKatsuApp() {
         : (currentWalk?.memo ?? '');
     const buildShareCacheKey = (walk, dogName) => {
         const logsSig = walk.actionLogs
-            .map((l) => `${l.id}:${l.poopCondition ?? ''}`)
+            .map((l) => `${l.id}:${l.type}:${l.poopCondition ?? ''}`)
             .join(',');
         return `${walk.id}:${walk.memo}:${walk.safePhotoDataUrl ?? ''}:${dogName}:${walk.sniffDurationSec}:${walk.actionLogs.length}:${logsSig}`;
     };
@@ -4474,6 +4937,62 @@ function KunKatsuApp() {
         }
         catch {
             showToast('記録の削除に失敗しました');
+        }
+        finally {
+            setIsSavingActionEdit(false);
+        }
+    };
+    const handleChangeActionLogType = async (logId, nextType) => {
+        if (!currentWalk || isSavingActionEdit)
+            return;
+        const target = currentWalk.actionLogs.find((l) => l.id === logId);
+        if (!target)
+            return;
+        const wasSniff = target.type === 'sniff_auto' || target.type === 'sniff_manual';
+        const willBeSniff = nextType === 'sniff_manual';
+        if ((wasSniff && willBeSniff) || target.type === nextType)
+            return;
+        const nextLogs = currentWalk.actionLogs.map((l) => {
+            if (l.id !== logId)
+                return l;
+            const nextLog = {
+                ...l,
+                type: nextType,
+                weight: 3,
+            };
+            if (nextType === 'poop') {
+                nextLog.poopCondition = l.poopCondition ?? 'normal';
+            }
+            else {
+                delete nextLog.poopCondition;
+            }
+            return nextLog;
+        });
+        let nextSniffDurationSec = currentWalk.sniffDurationSec;
+        if (wasSniff && !willBeSniff) {
+            nextSniffDurationSec = Math.max(0, currentWalk.sniffDurationSec - target.durationSec);
+        }
+        else if (!wasSniff && willBeSniff) {
+            nextSniffDurationSec = currentWalk.sniffDurationSec + target.durationSec;
+        }
+        const updated = {
+            ...currentWalk,
+            actionLogs: nextLogs,
+            sniffDurationSec: nextSniffDurationSec,
+        };
+        const toastMessageMap = {
+            sniff_manual: '👃 クン活に変更しました',
+            pee: '💧 おしっこに変更しました',
+            poop: '💩 うんちに変更しました',
+        };
+        setIsSavingActionEdit(true);
+        try {
+            await saveWalkSession(updated);
+            setAllWalks((prev) => prev.map((w) => (w.id === currentWalk.id ? updated : w)));
+            showToast(toastMessageMap[nextType]);
+        }
+        catch {
+            showToast('種類の変更に失敗しました');
         }
         finally {
             setIsSavingActionEdit(false);
@@ -4620,6 +5139,48 @@ function KunKatsuApp() {
         const cutoff = now - periodDays * 24 * 60 * 60 * 1000;
         return allWalks.filter((w) => w.startTime >= cutoff);
     }, [allWalks, periodFilter]);
+    // ごぶさたコース＆ルート鮮度の集計（完全ローカル・外部通信ゼロ）
+    const staleDaysSetting = profile?.staleRouteDays ?? ROUTE_FRESHNESS_DEFAULT_STALE_DAYS;
+    const routeFreshness = useMemo(() => calculateRouteFreshness(allWalks, staleDaysSetting), [allWalks, staleDaysSetting]);
+    const heatmapRouteFreshness = useMemo(() => calculateRouteFreshness(filteredWalks, staleDaysSetting), [filteredWalks, staleDaysSetting]);
+    const selectedSuggestedCourse = useMemo(() => {
+        if (!selectedSuggestedClusterId)
+            return null;
+        return (routeFreshness.courses.find((c) => c.clusterId === selectedSuggestedClusterId) ?? null);
+    }, [routeFreshness.courses, selectedSuggestedClusterId]);
+    const handleToggleSuggestedCourse = (course) => {
+        if (selectedSuggestedClusterId === course.clusterId) {
+            setSelectedSuggestedClusterId(null);
+            return;
+        }
+        setSelectedSuggestedClusterId(course.clusterId);
+        setWalkSuggestedFocusPoint((prev) => ({
+            lat: course.centerLat,
+            lng: course.centerLng,
+            key: (prev?.key ?? 0) + 1,
+        }));
+        walkMapContainerRef.current?.scrollIntoView({
+            behavior: 'smooth',
+            block: 'center',
+        });
+    };
+    const formatCourseDistanceLabel = (meters) => {
+        if (meters >= 1000) {
+            return `${(meters / 1000).toFixed(1)}km`;
+        }
+        return `${Math.round(meters)}m`;
+    };
+    const formatCourseDurationLabel = (durationSec) => {
+        const mins = Math.max(1, Math.round(durationSec / 60));
+        return `約${mins}分`;
+    };
+    const formatCourseDaysAgoLabel = (days) => {
+        if (days <= 0)
+            return 'きょう';
+        if (days === 1)
+            return 'きのう';
+        return `前回${days}日前`;
+    };
     // サマリー画面表示時のシェア画像事前生成（Web Share API の即時タップ発火用）
     useEffect(() => {
         if (activeTab === 'summary' && currentWalk && currentShareCacheKey) {
@@ -4883,8 +5444,26 @@ function KunKatsuApp() {
                 React.createElement("div", { className: `p-2.5 rounded-2xl text-center border ${theme.statSniffTile}` },
                     React.createElement("span", { className: "text-[11px] font-medium block" }, "\uD83D\uDC43 \u30AF\u30F3\u6D3B"),
                     React.createElement("p", { className: "text-lg font-bold tabular-nums mt-0.5" }, formatTime(sniffTotalSec)))),
-            React.createElement("div", { className: "h-64 w-full" },
-                React.createElement(DualMap, { engine: mapEngine, mapboxToken: profile?.mapboxPublicToken || '', darkMode: darkMode, centerLat: currentLat, centerLng: currentLng, routePoints: routePoints, actionLogs: actionLogs, encounters: encounters, activeLayer: "sniff" })),
+            React.createElement("div", { ref: walkMapContainerRef, className: "h-64 w-full" },
+                React.createElement(DualMap, { engine: mapEngine, mapboxToken: profile?.mapboxPublicToken || '', darkMode: darkMode, centerLat: !isWalking && selectedSuggestedCourse
+                        ? selectedSuggestedCourse.centerLat
+                        : currentLat, centerLng: !isWalking && selectedSuggestedCourse
+                        ? selectedSuggestedCourse.centerLng
+                        : currentLng, routePoints: routePoints, actionLogs: actionLogs, encounters: encounters, activeLayer: "sniff", suggestedRoutePoints: !isWalking && selectedSuggestedCourse
+                        ? selectedSuggestedCourse.routePoints
+                        : null, focusPoint: !isWalking ? walkSuggestedFocusPoint : null })),
+            !isWalking && selectedSuggestedCourse && (React.createElement("div", { className: `px-3 py-1.5 rounded-2xl border text-[11px] flex items-center justify-between gap-2 ${darkMode
+                    ? 'bg-sky-950/60 border-sky-700/60 text-sky-200'
+                    : 'bg-sky-50 border-sky-200 text-sky-800'}` },
+                React.createElement("span", { className: "truncate font-medium" },
+                    "\uD83E\uDDED \u63D0\u6848\u30B3\u30FC\u30B9\u3092\u8868\u793A\u4E2D\uFF08",
+                    formatCourseDaysAgoLabel(selectedSuggestedCourse.daysSinceLastWalk),
+                    "\u30FB",
+                    formatCourseDistanceLabel(selectedSuggestedCourse.distanceMeters),
+                    "\u30FB",
+                    formatCourseDurationLabel(selectedSuggestedCourse.durationSec),
+                    "\uFF09"),
+                React.createElement("button", { type: "button", onClick: () => setSelectedSuggestedClusterId(null), className: "shrink-0 font-bold underline" }, "\u30AF\u30EA\u30A2"))),
             geofenceMaskedCount > 0 && (React.createElement("p", { className: `text-[11px] ${theme.textSecondary} text-center` },
                 "\uD83C\uDFE0 \u304A\u3046\u3061\u306E\u307E\u308F\u308A: ",
                 geofenceMaskedCount,
@@ -4893,6 +5472,56 @@ function KunKatsuApp() {
                 React.createElement(WeatherCard, { snapshot: weatherSnapshot, loading: isWeatherLoading, error: weatherError, dog: profile, darkMode: darkMode, onRefresh: () => {
                         void loadWeather(currentLat, currentLng, true);
                     }, onOpenSettings: () => switchTab('settings') }),
+                React.createElement("div", { className: `p-3.5 rounded-3xl border flex flex-col gap-2 ${theme.card}` },
+                    React.createElement("div", { className: "flex items-center justify-between gap-2" },
+                        React.createElement("div", { className: "flex items-center gap-1.5" },
+                            React.createElement("span", { className: "text-sm" }, "\uD83E\uDDED"),
+                            React.createElement("h3", { className: `text-xs font-bold ${theme.textPrimary}` }, "\u304D\u3087\u3046\u306E\u3054\u3076\u3055\u305F\u30B3\u30FC\u30B9")),
+                        React.createElement("span", { className: `text-[10px] ${theme.textMuted}` }, routeFreshness.hasEnoughData
+                            ? `目安 ${routeFreshness.staleDays}日以上（タップで地図表示）`
+                            : '過去ログから自動提案')),
+                    !routeFreshness.hasEnoughData ? (React.createElement("p", { className: `text-[11px] leading-relaxed ${theme.textSecondary}` },
+                        "\uD83D\uDC3E \u3042\u3068",
+                        React.createElement("span", { className: "font-bold tabular-nums mx-0.5" }, Math.max(1, ROUTE_FRESHNESS_MIN_VALID_WALKS - routeFreshness.validWalkCount)),
+                        "\u56DE\u304A\u3055\u3093\u307D\u3092\u8A18\u9332\u3059\u308B\u3068\u3001\u3057\u3070\u3089\u304F\u6B69\u3044\u3066\u3044\u306A\u3044\u30B3\u30FC\u30B9\u3092\u3053\u3053\u304B\u3089\u63D0\u6848\u3067\u304D\u307E\u3059\u3002")) : (React.createElement("div", { className: "flex flex-col gap-1.5" },
+                        routeFreshness.suggestions.length === 0 && (React.createElement("p", { className: `text-[10px] ${theme.textSecondary}` },
+                            "\u2728 \u76F4\u8FD1",
+                            routeFreshness.staleDays,
+                            "\u65E5\u4EE5\u5185\u306B\u3069\u306E\u30B3\u30FC\u30B9\u3082\u6B69\u3044\u3066\u3044\u307E\u3059\uFF01\u6BD4\u8F03\u7684\u65E5\u304C\u7A7A\u3044\u305F\u30B3\u30FC\u30B9\uFF1A")),
+                        routeFreshness.courses.map((course, idx) => {
+                            const isSelected = selectedSuggestedClusterId === course.clusterId;
+                            return (React.createElement("button", { key: course.clusterId, type: "button", onClick: () => handleToggleSuggestedCourse(course), className: `w-full px-3 py-2 rounded-2xl border text-left transition active:scale-[0.99] flex items-center justify-between gap-2 ${isSelected
+                                    ? darkMode
+                                        ? 'bg-sky-900/40 border-sky-500 text-sky-100 shadow-xs'
+                                        : 'bg-sky-50 border-sky-400 text-sky-950 shadow-xs'
+                                    : theme.subCard}` },
+                                React.createElement("div", { className: "flex items-center gap-2 min-w-0" },
+                                    React.createElement("span", { className: `w-5 h-5 rounded-full text-[11px] font-bold flex items-center justify-center shrink-0 ${course.isStale
+                                            ? darkMode
+                                                ? 'bg-sky-800 text-sky-200'
+                                                : 'bg-sky-100 text-sky-800'
+                                            : darkMode
+                                                ? 'bg-[#3A3450] text-[#B8AFA3]'
+                                                : 'bg-orange-100 text-stone-700'}` }, idx + 1),
+                                    React.createElement("div", { className: "min-w-0" },
+                                        React.createElement("p", { className: `text-xs font-bold tabular-nums truncate ${theme.textPrimary}` },
+                                            formatCourseDaysAgoLabel(course.daysSinceLastWalk),
+                                            "\u30FB",
+                                            formatCourseDistanceLabel(course.distanceMeters),
+                                            "\u30FB",
+                                            formatCourseDurationLabel(course.durationSec)),
+                                        React.createElement("p", { className: `text-[10px] tabular-nums truncate ${theme.textMuted}` },
+                                            "\u3053\u308C\u307E\u3067\u306B",
+                                            course.walkCount,
+                                            "\u56DE\u304A\u3055\u3093\u307D"))),
+                                React.createElement("span", { className: `text-[11px] font-bold shrink-0 px-2 py-0.5 rounded-full ${isSelected
+                                        ? darkMode
+                                            ? 'bg-sky-500 text-slate-950'
+                                            : 'bg-sky-600 text-white'
+                                        : darkMode
+                                            ? 'text-sky-300'
+                                            : 'text-sky-700'}` }, isSelected ? '表示中' : '地図で見る')));
+                        })))),
                 React.createElement("div", { className: "flex flex-col gap-2.5" },
                     React.createElement("button", { onClick: () => startWalk(false), className: `w-full py-4 rounded-full font-bold text-lg active:scale-95 transition flex items-center justify-center gap-2 ${theme.primaryBtn}` },
                         React.createElement("span", null, "\uD83D\uDC3E"),
@@ -5136,12 +5765,25 @@ function KunKatsuApp() {
                 React.createElement("span", null, "\uD83D\uDDFA\uFE0F"),
                 " \u3088\u304F\u884C\u304F\u304A\u3055\u3093\u307D\u30DE\u30C3\u30D7"),
             React.createElement("div", { className: `grid grid-cols-3 gap-1 p-1 rounded-2xl text-xs ${theme.segmentTrack}` }, ['week', 'month', 'all'].map((p) => (React.createElement("button", { key: p, onClick: () => setPeriodFilter(p), className: `py-1.5 rounded-xl transition-all ${periodFilter === p ? theme.segmentActive : theme.segmentInactive}` }, p === 'week' ? '直近1週間' : p === 'month' ? '直近1ヶ月' : '全期間')))),
-            React.createElement("div", { className: `grid grid-cols-3 gap-1 p-1 rounded-2xl text-xs ${theme.segmentTrack}` },
+            React.createElement("div", { className: `grid grid-cols-4 gap-1 p-1 rounded-2xl text-xs ${theme.segmentTrack}` },
                 React.createElement("button", { onClick: () => setHeatmapLayer('sniff'), className: `py-1.5 rounded-xl transition-all ${heatmapLayer === 'sniff' ? theme.segmentActive : theme.segmentInactive}` }, "\uD83D\uDC43 \u30AF\u30F3\u6D3B"),
                 React.createElement("button", { onClick: () => setHeatmapLayer('excretion'), className: `py-1.5 rounded-xl transition-all ${heatmapLayer === 'excretion' ? theme.segmentActive : theme.segmentInactive}` }, "\uD83D\uDCA7 \u30C8\u30A4\u30EC"),
-                React.createElement("button", { onClick: () => setHeatmapLayer('route'), className: `py-1.5 rounded-xl transition-all ${heatmapLayer === 'route' ? theme.segmentActive : theme.segmentInactive}` }, "\uD83D\uDC63 \u3088\u304F\u901A\u308B\u9053")),
+                React.createElement("button", { onClick: () => setHeatmapLayer('route'), className: `py-1.5 rounded-xl transition-all ${heatmapLayer === 'route' ? theme.segmentActive : theme.segmentInactive}` }, "\uD83D\uDC63 \u3088\u304F\u901A\u308B\u9053"),
+                React.createElement("button", { onClick: () => setHeatmapLayer('freshness'), className: `py-1.5 rounded-xl transition-all ${heatmapLayer === 'freshness' ? theme.segmentActive : theme.segmentInactive}` }, "\uD83E\uDDED \u3054\u3076\u3055\u305F")),
+            heatmapLayer === 'freshness' && (React.createElement("div", { className: `px-3 py-2 rounded-2xl border text-[11px] flex items-center justify-between gap-2 ${theme.subCard}` },
+                React.createElement("span", { className: theme.textSecondary },
+                    "\uD83E\uDDED \u9053\u306E\u9BAE\u5EA6\u30DE\u30C3\u30D7\uFF08\u76EE\u5B89: ",
+                    heatmapRouteFreshness.staleDays,
+                    "\u65E5\u4EE5\u4E0A\u3067\u3054\u3076\u3055\u305F\uFF09"),
+                React.createElement("span", { className: "flex items-center gap-2 shrink-0 font-semibold" },
+                    React.createElement("span", { className: "inline-flex items-center gap-1" },
+                        React.createElement("span", { className: "w-2.5 h-2.5 rounded-full bg-red-500 inline-block" }),
+                        React.createElement("span", null, "\u6700\u8FD1")),
+                    React.createElement("span", { className: "inline-flex items-center gap-1" },
+                        React.createElement("span", { className: "w-2.5 h-2.5 rounded-full bg-blue-600 inline-block" }),
+                        React.createElement("span", null, "\u3054\u3076\u3055\u305F"))))),
             React.createElement("div", { ref: heatmapMapContainerRef, className: "h-80 w-full rounded-2xl overflow-hidden border border-orange-100/50" },
-                React.createElement(DualMap, { engine: mapEngine, mapboxToken: profile?.mapboxPublicToken || '', darkMode: darkMode, centerLat: heatmapCenter.lat, centerLng: heatmapCenter.lng, routePoints: filteredWalks.flatMap((w) => w.routePoints), actionLogs: filteredWalks.flatMap((w) => w.actionLogs), activeLayer: heatmapLayer, rankedSpots: rankedHeatmapSpots, focusPoint: heatmapFocusPoint })),
+                React.createElement(DualMap, { engine: mapEngine, mapboxToken: profile?.mapboxPublicToken || '', darkMode: darkMode, centerLat: heatmapCenter.lat, centerLng: heatmapCenter.lng, routePoints: filteredWalks.flatMap((w) => w.routePoints), actionLogs: filteredWalks.flatMap((w) => w.actionLogs), activeLayer: heatmapLayer, rankedSpots: rankedHeatmapSpots, focusPoint: heatmapFocusPoint, freshnessCells: heatmapRouteFreshness.cells })),
             React.createElement("div", { className: `p-3.5 rounded-2xl border ${theme.card} text-xs` },
                 React.createElement("div", { className: "flex items-center justify-between gap-2" },
                     React.createElement("span", { className: `font-bold block ${theme.textPrimary}` }, "\uD83D\uDCA1 \u304A\u6C17\u306B\u5165\u308A\u30AF\u30F3\u6D3B\u30B9\u30DD\u30C3\u30C8 Top3"),
@@ -5262,6 +5904,14 @@ function KunKatsuApp() {
                     }, className: `py-2 px-3 rounded-xl text-xs font-semibold active:scale-95 transition ${theme.secondaryBtn} w-fit` }, "\uD83D\uDCCD \u4ECA\u3044\u308B\u5834\u6240\u3092\u81EA\u5B85\u3068\u3057\u3066\u767B\u9332\uFF08\u4F4D\u7F6E\u306F\u81EA\u52D5\u3067\u305A\u3089\u3057\u307E\u3059\uFF09"),
                 profile.homeLat !== null && (React.createElement("span", { className: `text-xs px-2.5 py-1 rounded-full w-fit ${theme.mintBadge}` }, "\u2705 \u81EA\u5B85\u5468\u8FBA\u306E\u304B\u304F\u3057\u8A2D\u5B9A\u304C\u6709\u52B9\u3067\u3059"))),
             React.createElement("div", { className: `p-3.5 rounded-2xl border flex flex-col gap-2.5 ${theme.card}` },
+                React.createElement("div", null,
+                    React.createElement("h3", { className: `font-bold text-sm ${theme.textPrimary}` }, "\uD83E\uDDED \u3054\u3076\u3055\u305F\u30B3\u30FC\u30B9\u63D0\u6848"),
+                    React.createElement("p", { className: `text-[11px] mt-0.5 ${theme.textSecondary}` }, "\u6307\u5B9A\u3057\u305F\u65E5\u6570\u4EE5\u4E0A\u6B69\u3044\u3066\u3044\u306A\u3044\u30B3\u30FC\u30B9\u3092\u300C\u3054\u3076\u3055\u305F\u300D\u3068\u3057\u3066\u304A\u6563\u6B69\u524D\u306B\u63D0\u6848\u3057\u3001\u30D2\u30FC\u30C8\u30DE\u30C3\u30D7\u4E0A\u3067\u9752\u304F\u8868\u793A\u3057\u307E\u3059\uFF083\u301C60\u65E5\uFF09\u3002")),
+                React.createElement("div", { className: "flex items-center gap-2 text-xs" },
+                    React.createElement("label", { htmlFor: "stale-route-days-input", className: `font-medium ${theme.textSecondary}` }, "\u3054\u3076\u3055\u305F\u5224\u5B9A\u65E5\u6570:"),
+                    React.createElement("input", { id: "stale-route-days-input", type: "text", inputMode: "numeric", value: staleRouteDaysDraft, onChange: (e) => handleNumericDraftChange(e, setStaleRouteDaysDraft), onCompositionEnd: (e) => setStaleRouteDaysDraft(normalizeNumericDraft(e.currentTarget.value)), onBlur: (e) => commitNumericProfileField(e.currentTarget.value, 'staleRouteDays', 3, 60, profile.staleRouteDays ?? ROUTE_FRESHNESS_DEFAULT_STALE_DAYS, 0, setStaleRouteDaysDraft), className: `w-20 px-2.5 py-1 rounded-xl text-center font-bold tabular-nums ${theme.input}` }),
+                    React.createElement("span", { className: theme.textSecondary }, "\u65E5\u4EE5\u4E0A (3\u301C60\u65E5)"))),
+            React.createElement("div", { className: `p-3.5 rounded-2xl border flex flex-col gap-2.5 ${theme.card}` },
                 React.createElement("h3", { className: `font-bold text-sm ${theme.textPrimary}` }, "\uD83D\uDDFA\uFE0F \u5730\u56F3\u30A8\u30F3\u30B8\u30F3\u5207\u66FF\uFF08\u958B\u767A\u7528\uFF09"),
                 React.createElement("div", { className: `grid grid-cols-2 gap-1 p-1 rounded-2xl ${theme.segmentTrack}` },
                     React.createElement("button", { onClick: () => setMapEngine('osm'), className: `flex-1 py-1.5 rounded-xl text-xs font-medium transition-all ${mapEngine === 'osm' ? theme.segmentActive : theme.segmentInactive}` }, "OpenStreetMap (\u7121\u6599)"),
@@ -5286,6 +5936,7 @@ function KunKatsuApp() {
                     const clampedDogWeight = clampProfileNumber(dogWeightDraft, 0.5, 100, profile.weightKg, 1);
                     const clampedOwnerWeight = clampProfileNumber(ownerWeightDraft, 20, 200, profile.ownerWeightKg, 1);
                     const clampedRadius = clampProfileNumber(geofenceRadiusDraft, 150, Number.MAX_SAFE_INTEGER, profile.geofenceRadiusMeters, 0);
+                    const clampedStaleDays = clampProfileNumber(staleRouteDaysDraft, 3, 60, profile.staleRouteDays ?? ROUTE_FRESHNESS_DEFAULT_STALE_DAYS, 0);
                     const normalizedProfile = {
                         ...profile,
                         name: profile.name.trim() || '愛犬',
@@ -5294,11 +5945,13 @@ function KunKatsuApp() {
                         weightKg: clampedDogWeight,
                         ownerWeightKg: clampedOwnerWeight,
                         geofenceRadiusMeters: clampedRadius,
+                        staleRouteDays: clampedStaleDays,
                     };
                     setProfile(normalizedProfile);
                     setDogWeightDraft(String(clampedDogWeight));
                     setOwnerWeightDraft(String(clampedOwnerWeight));
                     setGeofenceRadiusDraft(String(clampedRadius));
+                    setStaleRouteDaysDraft(String(clampedStaleDays));
                     await saveDogProfile(normalizedProfile);
                     showToast('✅ 設定を端末内ローカルに保存しました');
                 }, className: `w-full py-3.5 rounded-full font-bold text-sm active:scale-95 transition ${theme.primaryBtn} mt-2` }, "\u8A2D\u5B9A\u3092\u4FDD\u5B58\u3059\u308B"))),
@@ -5313,7 +5966,9 @@ function KunKatsuApp() {
                         URL.revokeObjectURL(showShareModalUrl);
                         setShowShareModalUrl(null);
                     }, className: `w-full py-2.5 rounded-full text-xs font-bold active:scale-95 transition mt-1 ${theme.secondaryBtn}` }, "\u3068\u3058\u308B")))),
-        activeTab === 'summary' && editingActionLog && (React.createElement(MapPointEditSheet, { key: editingActionLog.id, log: editingActionLog, darkMode: darkMode, isSaving: isSavingActionEdit, onClose: () => setEditingActionLogId(null), onUpdatePoopCondition: (logId, condition) => {
+        activeTab === 'summary' && editingActionLog && (React.createElement(MapPointEditSheet, { key: editingActionLog.id, log: editingActionLog, darkMode: darkMode, isSaving: isSavingActionEdit, onClose: () => setEditingActionLogId(null), onChangeType: (logId, nextType) => {
+                void handleChangeActionLogType(logId, nextType);
+            }, onUpdatePoopCondition: (logId, condition) => {
                 void handleUpdateActionPoopCondition(logId, condition);
             }, onDelete: (logId) => {
                 void handleDeleteActionLog(logId);
