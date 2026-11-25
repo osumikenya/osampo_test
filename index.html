@@ -1438,8 +1438,10 @@ function calculateRouteFreshness(walks, staleDaysOrOptions = ROUTE_FRESHNESS_DEF
  * トップレベル定数・関数名は weather* / WEATHER_* プレフィックスで衝突を回避する。
  */
 const WEATHER_OPEN_METEO_ENDPOINT = 'https://api.open-meteo.com/v1/forecast';
-const WEATHER_CACHE_KEY = 'kunkatsu_weather_cache_v1';
+const WEATHER_CACHE_KEY = 'kunkatsu_weather_cache_v2';
 const WEATHER_CACHE_TTL_MS = 30 * 60 * 1000; // 30分
+const WEATHER_MODEL_SUFFIXES_JMA_FIRST = ['_jma_seamless', '_best_match', ''];
+const WEATHER_MODEL_SUFFIXES_PROB_FIRST = ['_best_match', '_jma_seamless', ''];
 const WEATHER_CACHE_COORD_DIFF_LIMIT = 0.02; // 小数点2桁で0.02度未満（約2km未満）なら同一エリア扱い
 const WEATHER_FETCH_TIMEOUT_MS = 5000; // 5秒タイムアウト
 /**
@@ -1515,7 +1517,7 @@ function buildOpenMeteoUrl(lat, lng) {
         current: 'temperature_2m,apparent_temperature,relative_humidity_2m,wind_speed_10m,weather_code,is_day',
         hourly: 'precipitation_probability,precipitation,apparent_temperature',
         daily: 'sunset',
-        models: 'jma_seamless',
+        models: 'jma_seamless,best_match',
         timezone: 'Asia/Tokyo',
         wind_speed_unit: 'ms',
         forecast_days: '2',
@@ -1527,6 +1529,47 @@ function weatherIsRecord(value) {
 }
 function weatherAsFiniteNumber(value) {
     return typeof value === 'number' && Number.isFinite(value) ? value : null;
+}
+function weatherPickNumber(record, baseKey, suffixes) {
+    for (const suffix of suffixes) {
+        const val = weatherAsFiniteNumber(record[`${baseKey}${suffix}`]);
+        if (val !== null)
+            return val;
+    }
+    return null;
+}
+function weatherPickIsDay(record, suffixes) {
+    for (const suffix of suffixes) {
+        const val = record[`is_day${suffix}`];
+        if (typeof val === 'number')
+            return val === 1;
+        if (typeof val === 'boolean')
+            return val;
+    }
+    return true;
+}
+function weatherPickHourlyNumber(hourly, baseKey, index, suffixes) {
+    for (const suffix of suffixes) {
+        const arr = hourly[`${baseKey}${suffix}`];
+        if (!Array.isArray(arr))
+            continue;
+        const val = weatherAsFiniteNumber(arr[index]);
+        if (val !== null)
+            return val;
+    }
+    return null;
+}
+function weatherPickDailySunset(daily, todayIndex, suffixes) {
+    for (const suffix of suffixes) {
+        const arr = daily[`sunset${suffix}`];
+        if (!Array.isArray(arr))
+            continue;
+        const candidate = todayIndex >= 0 ? arr[todayIndex] : arr[0];
+        if (typeof candidate === 'string' && candidate.length > 0) {
+            return candidate;
+        }
+    }
+    return null;
 }
 function weatherParseJstIsoMs(iso) {
     if (!iso || typeof iso !== 'string')
@@ -1553,11 +1596,11 @@ function parseOpenMeteoResponse(json, roundedLat, roundedLng, nowMs = Date.now()
         throw new Error('天気データの形式が不正です（current が見つかりません）');
     }
     const current = json.current;
-    const temperatureC = weatherAsFiniteNumber(current.temperature_2m);
-    const apparentTemperatureC = weatherAsFiniteNumber(current.apparent_temperature);
-    const humidityPct = weatherAsFiniteNumber(current.relative_humidity_2m);
-    const windSpeedMs = weatherAsFiniteNumber(current.wind_speed_10m);
-    const weatherCode = weatherAsFiniteNumber(current.weather_code);
+    const temperatureC = weatherPickNumber(current, 'temperature_2m', WEATHER_MODEL_SUFFIXES_JMA_FIRST);
+    const apparentTemperatureC = weatherPickNumber(current, 'apparent_temperature', WEATHER_MODEL_SUFFIXES_JMA_FIRST);
+    const humidityPct = weatherPickNumber(current, 'relative_humidity_2m', WEATHER_MODEL_SUFFIXES_JMA_FIRST);
+    const windSpeedMs = weatherPickNumber(current, 'wind_speed_10m', WEATHER_MODEL_SUFFIXES_JMA_FIRST);
+    const weatherCode = weatherPickNumber(current, 'weather_code', WEATHER_MODEL_SUFFIXES_JMA_FIRST);
     if (temperatureC === null ||
         apparentTemperatureC === null ||
         humidityPct === null ||
@@ -1565,23 +1608,11 @@ function parseOpenMeteoResponse(json, roundedLat, roundedLng, nowMs = Date.now()
         weatherCode === null) {
         throw new Error('天気データの必須項目が不足しています');
     }
-    const isDay = typeof current.is_day === 'number'
-        ? current.is_day === 1
-        : typeof current.is_day === 'boolean'
-            ? current.is_day
-            : true;
+    const isDay = weatherPickIsDay(current, WEATHER_MODEL_SUFFIXES_JMA_FIRST);
     const hourlyNext3h = [];
     if (weatherIsRecord(json.hourly) && Array.isArray(json.hourly.time)) {
+        const hourly = json.hourly;
         const times = json.hourly.time;
-        const probs = Array.isArray(json.hourly.precipitation_probability)
-            ? json.hourly.precipitation_probability
-            : [];
-        const precips = Array.isArray(json.hourly.precipitation)
-            ? json.hourly.precipitation
-            : [];
-        const apparents = Array.isArray(json.hourly.apparent_temperature)
-            ? json.hourly.apparent_temperature
-            : [];
         for (let i = 0; i < times.length && hourlyNext3h.length < 3; i += 1) {
             const timeIso = times[i];
             if (typeof timeIso !== 'string')
@@ -1589,26 +1620,23 @@ function parseOpenMeteoResponse(json, roundedLat, roundedLng, nowMs = Date.now()
             const pointMs = weatherParseJstIsoMs(timeIso);
             if (!Number.isFinite(pointMs) || pointMs < nowMs)
                 continue;
-            const prob = weatherAsFiniteNumber(probs[i]) ?? 0;
-            const precip = weatherAsFiniteNumber(precips[i]) ?? 0;
-            const apparent = weatherAsFiniteNumber(apparents[i]) ?? apparentTemperatureC;
+            const prob = weatherPickHourlyNumber(hourly, 'precipitation_probability', i, WEATHER_MODEL_SUFFIXES_PROB_FIRST);
+            const precip = weatherPickHourlyNumber(hourly, 'precipitation', i, WEATHER_MODEL_SUFFIXES_JMA_FIRST) ?? 0;
+            const apparent = weatherPickHourlyNumber(hourly, 'apparent_temperature', i, WEATHER_MODEL_SUFFIXES_JMA_FIRST) ?? apparentTemperatureC;
             hourlyNext3h.push({
                 timeIso,
-                precipitationProbability: Math.max(0, Math.min(100, Math.round(prob))),
+                precipitationProbability: prob === null ? null : Math.max(0, Math.min(100, Math.round(prob))),
                 precipitationMm: Math.max(0, precip),
                 apparentTemperatureC: apparent,
             });
         }
     }
     let sunsetIso = null;
-    if (weatherIsRecord(json.daily) && Array.isArray(json.daily.sunset)) {
+    if (weatherIsRecord(json.daily)) {
         const dailyTimes = Array.isArray(json.daily.time) ? json.daily.time : [];
         const todayJst = weatherFormatJstDate(nowMs);
         const todayIndex = dailyTimes.findIndex((t) => t === todayJst);
-        const candidate = todayIndex >= 0 ? json.daily.sunset[todayIndex] : json.daily.sunset[0];
-        if (typeof candidate === 'string' && candidate.length > 0) {
-            sunsetIso = candidate;
-        }
+        sunsetIso = weatherPickDailySunset(json.daily, todayIndex, WEATHER_MODEL_SUFFIXES_JMA_FIRST);
     }
     return {
         temperatureC,
@@ -1623,6 +1651,18 @@ function parseOpenMeteoResponse(json, roundedLat, roundedLng, nowMs = Date.now()
         roundedLat: roundWeatherCoord(roundedLat),
         roundedLng: roundWeatherCoord(roundedLng),
     };
+}
+function weatherIsValidHourlyPoint(value) {
+    if (!weatherIsRecord(value))
+        return false;
+    return (typeof value.timeIso === 'string' &&
+        (value.precipitationProbability === null ||
+            (typeof value.precipitationProbability === 'number' &&
+                Number.isFinite(value.precipitationProbability))) &&
+        typeof value.precipitationMm === 'number' &&
+        Number.isFinite(value.precipitationMm) &&
+        typeof value.apparentTemperatureC === 'number' &&
+        Number.isFinite(value.apparentTemperatureC));
 }
 function weatherIsValidSnapshot(value) {
     if (!weatherIsRecord(value))
@@ -1639,6 +1679,7 @@ function weatherIsValidSnapshot(value) {
         Number.isFinite(value.weatherCode) &&
         typeof value.isDay === 'boolean' &&
         Array.isArray(value.hourlyNext3h) &&
+        value.hourlyNext3h.every(weatherIsValidHourlyPoint) &&
         (value.sunsetIso === null || typeof value.sunsetIso === 'string') &&
         typeof value.fetchedAtMs === 'number' &&
         Number.isFinite(value.fetchedAtMs) &&
@@ -2011,10 +2052,11 @@ function getWalkConditionTagLabel(tag) {
 function evaluateDogWalkWeather(snapshot, dog, nowInput = Date.now()) {
     const nowMs = typeof nowInput === 'number' ? nowInput : nowInput.getTime();
     const thresholds = resolveDogClimateThresholds(dog, nowMs);
-    let maxRainProb3h = 0;
+    let maxRainProb3h = null;
     let maxRainMm3h = 0;
     for (const point of snapshot.hourlyNext3h) {
-        if (point.precipitationProbability > maxRainProb3h) {
+        if (point.precipitationProbability !== null &&
+            (maxRainProb3h === null || point.precipitationProbability > maxRainProb3h)) {
             maxRainProb3h = point.precipitationProbability;
         }
         if (point.precipitationMm > maxRainMm3h) {
@@ -2022,7 +2064,8 @@ function evaluateDogWalkWeather(snapshot, dog, nowInput = Date.now()) {
         }
     }
     const isHeatDanger = snapshot.apparentTemperatureC >= thresholds.heatDangerC;
-    const isRainAlert = snapshot.hourlyNext3h.some((point) => point.precipitationProbability >= CLIMATE_RAIN_PROB_THRESHOLD_PCT ||
+    const isRainAlert = snapshot.hourlyNext3h.some((point) => (point.precipitationProbability !== null &&
+        point.precipitationProbability >= CLIMATE_RAIN_PROB_THRESHOLD_PCT) ||
         point.precipitationMm >= CLIMATE_RAIN_MM_THRESHOLD);
     const isHeatCaution = !isHeatDanger && snapshot.apparentTemperatureC >= thresholds.heatCautionC;
     const isColdCaution = snapshot.apparentTemperatureC <= thresholds.coldCautionC;
@@ -2068,7 +2111,15 @@ function evaluateDogWalkWeather(snapshot, dog, nowInput = Date.now()) {
             break;
         case 'rain_alert':
             label = '雨予報';
-            headline = `3時間以内の降水確率 ${Math.round(maxRainProb3h)}%`;
+            if (maxRainMm3h >= 0.1) {
+                headline = `3時間以内に雨 最大${maxRainMm3h.toFixed(1)}mm`;
+            }
+            else if (maxRainProb3h !== null) {
+                headline = `3時間以内の降水確率 ${Math.round(maxRainProb3h)}%`;
+            }
+            else {
+                headline = '降水確率は取得できませんでした';
+            }
             advice =
                 '雨が降りやすい予報です。レインコートの準備や、お散歩時間の前倒しをご検討ください。';
             break;
@@ -3713,10 +3764,10 @@ function weatherCardFormatHourLabel(timeIso) {
     }
 }
 function weatherCardFormatHourlyRainIcon(prob, rainMm) {
-    if (prob >= 50 || rainMm >= 1) {
+    if ((prob !== null && prob >= 50) || rainMm >= 1) {
         return '☔';
     }
-    if (prob >= 30 || rainMm >= 0.2) {
+    if ((prob !== null && prob >= 30) || rainMm >= 0.2) {
         return '🌦️';
     }
     return '☁️';
@@ -3811,8 +3862,19 @@ function WeatherCard({ snapshot, loading, error, dog, darkMode, onRefresh, onOpe
             })))),
         React.createElement("div", { className: "space-y-1.5" },
             hourlyPoints.length > 0 && (React.createElement("div", { className: "grid grid-cols-3 gap-1.5" }, hourlyPoints.map((point) => {
-                const prob = Math.round(point.precipitationProbability);
-                const isHighRain = prob >= 50;
+                const prob = point.precipitationProbability === null
+                    ? null
+                    : Math.round(point.precipitationProbability);
+                const hasRainMm = point.precipitationMm >= 0.1;
+                const isHighRain = (prob !== null && prob >= 50) || point.precipitationMm >= 1;
+                const valueLabel = hasRainMm
+                    ? `${point.precipitationMm.toFixed(1)}mm`
+                    : prob === null
+                        ? '--%'
+                        : `${prob}%`;
+                const icon = hasRainMm
+                    ? '☔'
+                    : weatherCardFormatHourlyRainIcon(prob, point.precipitationMm);
                 return (React.createElement("div", { key: point.timeIso, className: `rounded-lg px-2 py-1.5 flex items-center justify-between gap-1 text-[11px] min-w-0 transition-colors ${isHighRain
                         ? darkMode
                             ? 'bg-blue-950/60 border border-blue-700/70 text-blue-200 font-bold'
@@ -3820,10 +3882,8 @@ function WeatherCard({ snapshot, loading, error, dog, darkMode, onRefresh, onOpe
                         : `${subSurface} ${textSecondary}`}` },
                     React.createElement("span", { className: "tabular-nums truncate" }, weatherCardFormatHourLabel(point.timeIso)),
                     React.createElement("span", { className: "inline-flex items-center gap-0.5 shrink-0 tabular-nums" },
-                        React.createElement("span", { "aria-hidden": "true" }, weatherCardFormatHourlyRainIcon(prob, point.precipitationMm)),
-                        React.createElement("span", null,
-                            prob,
-                            "%"))));
+                        React.createElement("span", { "aria-hidden": "true" }, icon),
+                        React.createElement("span", null, valueLabel))));
             }))),
             (evaluation.sunsetTimeLabel || evaluation.sunsetReminder) && (React.createElement("div", { className: `rounded-lg px-2.5 py-1.5 flex items-center justify-between gap-2 flex-wrap text-[11px] ${subSurface}` },
                 evaluation.sunsetTimeLabel && (React.createElement("span", { className: `font-semibold tabular-nums ${textSecondary}` },
