@@ -160,6 +160,136 @@ async function stripImageExifAndResize(file, maxWidth = 1080) {
         img.src = objectUrl;
     });
 }
+/**
+ * 自宅ジオフェンス内の生座標が保存されないよう、散歩セッション全体をサニタイズする（防衛的最終防壁）
+ */
+function sanitizeWalkForHomeZone(walk, profile) {
+    if (!profile ||
+        profile.homeLat === null ||
+        profile.homeLng === null ||
+        !Number.isFinite(profile.homeLat) ||
+        !Number.isFinite(profile.homeLng) ||
+        !Number.isFinite(profile.geofenceRadiusMeters) ||
+        profile.geofenceRadiusMeters <= 0) {
+        return walk;
+    }
+    const homeLat = profile.homeLat;
+    const homeLng = profile.homeLng;
+    const radius = profile.geofenceRadiusMeters;
+    const routePoints = walk.routePoints.filter((pt) => !isInsideHomeGeofence(pt.lat, pt.lng, homeLat, homeLng, radius));
+    const actionLogs = walk.actionLogs.map((log) => {
+        if (log.inHomeZone || isInsideHomeGeofence(log.lat, log.lng, homeLat, homeLng, radius)) {
+            return {
+                ...log,
+                lat: homeLat,
+                lng: homeLng,
+                inHomeZone: true,
+            };
+        }
+        return log;
+    });
+    const encounters = walk.encounters
+        ? walk.encounters.map((enc) => {
+            if (enc.inHomeZone || isInsideHomeGeofence(enc.lat, enc.lng, homeLat, homeLng, radius)) {
+                return {
+                    ...enc,
+                    lat: homeLat,
+                    lng: homeLng,
+                    inHomeZone: true,
+                };
+            }
+            return enc;
+        })
+        : undefined;
+    return {
+        ...walk,
+        routePoints,
+        actionLogs,
+        ...(encounters ? { encounters } : {}),
+    };
+}
+
+
+// --- distanceTracker.ts ---
+const DISTANCE_TRACKER_MAX_ACCURACY_M = 35;
+const DISTANCE_TRACKER_MIN_STEP_METERS = 3;
+const DISTANCE_TRACKER_MAX_SPEED_KMH = 30;
+/**
+ * 距離トラッカーの初期状態を生成する
+ */
+function distanceTrackerCreateState() {
+    return {
+        totalMeters: 0,
+        anchor: null,
+        pendingJump: null,
+    };
+}
+/**
+ * 新しいGPS座標を受け取り、アンカー方式＋精度・2点確認速度フィルタで累積距離（小数保持）を更新する純関数
+ */
+function distanceTrackerStep(state, lat, lng, timestamp, accuracyM) {
+    if (!Number.isFinite(lat) || !Number.isFinite(lng) || !Number.isFinite(timestamp)) {
+        return state;
+    }
+    if (accuracyM !== undefined &&
+        accuracyM !== null &&
+        (!Number.isFinite(accuracyM) ||
+            accuracyM < 0 ||
+            accuracyM > DISTANCE_TRACKER_MAX_ACCURACY_M)) {
+        return state;
+    }
+    if (!state.anchor) {
+        return {
+            totalMeters: state.totalMeters,
+            anchor: { lat, lng, timestamp },
+            pendingJump: null,
+        };
+    }
+    const timeDiffMs = timestamp - state.anchor.timestamp;
+    if (timeDiffMs <= 0) {
+        return state;
+    }
+    const dist = calculateDistanceMeters(state.anchor.lat, state.anchor.lng, lat, lng);
+    if (dist < DISTANCE_TRACKER_MIN_STEP_METERS) {
+        return state.pendingJump
+            ? { totalMeters: state.totalMeters, anchor: state.anchor, pendingJump: null }
+            : state;
+    }
+    const speedKmh = (dist / 1000) / (timeDiffMs / 3600000);
+    if (speedKmh > DISTANCE_TRACKER_MAX_SPEED_KMH) {
+        if (state.pendingJump) {
+            const jumpTimeDiffMs = timestamp - state.pendingJump.timestamp;
+            if (jumpTimeDiffMs > 0) {
+                const jumpDist = calculateDistanceMeters(state.pendingJump.lat, state.pendingJump.lng, lat, lng);
+                const jumpSpeedKmh = (jumpDist / 1000) / (jumpTimeDiffMs / 3600000);
+                if (jumpSpeedKmh <= DISTANCE_TRACKER_MAX_SPEED_KMH) {
+                    if (jumpDist >= DISTANCE_TRACKER_MIN_STEP_METERS) {
+                        return {
+                            totalMeters: state.totalMeters + jumpDist,
+                            anchor: { lat, lng, timestamp },
+                            pendingJump: null,
+                        };
+                    }
+                    return {
+                        totalMeters: state.totalMeters,
+                        anchor: state.pendingJump,
+                        pendingJump: null,
+                    };
+                }
+            }
+        }
+        return {
+            totalMeters: state.totalMeters,
+            anchor: state.anchor,
+            pendingJump: { lat, lng, timestamp },
+        };
+    }
+    return {
+        totalMeters: state.totalMeters + dist,
+        anchor: { lat, lng, timestamp },
+        pendingJump: null,
+    };
+}
 
 
 // --- db.ts ---
@@ -199,9 +329,13 @@ async function getDogProfile() {
                 const normalizedStaleDays = typeof stored.staleRouteDays === 'number' && Number.isFinite(stored.staleRouteDays)
                     ? Math.min(60, Math.max(3, Math.round(stored.staleRouteDays)))
                     : 14;
+                const normalizedOwnerStrideCm = typeof stored.ownerStrideCm === 'number' && Number.isFinite(stored.ownerStrideCm)
+                    ? Math.min(120, Math.max(40, Math.round(stored.ownerStrideCm)))
+                    : 70;
                 resolve({
                     ...stored,
                     staleRouteDays: normalizedStaleDays,
+                    ownerStrideCm: normalizedOwnerStrideCm,
                 });
             }
             else {
@@ -218,6 +352,7 @@ async function getDogProfile() {
                     mapboxPublicToken: '',
                     soundFeedbackEnabled: false,
                     staleRouteDays: 14,
+                    ownerStrideCm: 70,
                 };
                 resolve(defaultProfile);
             }
@@ -541,8 +676,10 @@ function generateShareCardBlob(walk, dogName = '愛犬') {
                 });
                 ctx.stroke();
                 ctx.restore();
-                // クン活・排泄ピン描画（シール風の白縁つき）
-                walk.actionLogs.forEach((log) => {
+                // クン活・排泄ピン描画（シール風の白縁つき・自宅周辺は除外）
+                walk.actionLogs
+                    .filter((log) => !log.inHomeZone)
+                    .forEach((log) => {
                     const x = toX(log.lng);
                     const y = toY(log.lat);
                     const pinRadius = log.weight >= 3 ? 11 : 8;
@@ -692,6 +829,28 @@ function generateShareCardBlob(walk, dogName = '愛犬') {
 const STATS_MIN_DURATION_SEC = 60;
 const STATS_MIN_DISTANCE_METERS = 50;
 const STATS_DEMO_ID_PREFIX = 'demo_';
+const STATS_DEFAULT_STRIDE_CM = 70;
+const STATS_MIN_STRIDE_CM = 40;
+const STATS_MAX_STRIDE_CM = 120;
+/**
+ * 歩行距離(m)と飼い主の歩幅(cm)から推定歩数を算出する（タスク 3.2）
+ * distanceMeters または明示指定された strideCm が不正値/0以下のときは 0 を返す
+ */
+function estimateSteps(distanceMeters, strideCm) {
+    if (typeof distanceMeters !== 'number' ||
+        !Number.isFinite(distanceMeters) ||
+        distanceMeters <= 0) {
+        return 0;
+    }
+    const resolvedStrideCm = strideCm ?? STATS_DEFAULT_STRIDE_CM;
+    if (typeof resolvedStrideCm !== 'number' ||
+        !Number.isFinite(resolvedStrideCm) ||
+        resolvedStrideCm <= 0) {
+        return 0;
+    }
+    const clampedStrideCm = Math.min(STATS_MAX_STRIDE_CM, Math.max(STATS_MIN_STRIDE_CM, resolvedStrideCm));
+    return Math.round(distanceMeters / (clampedStrideCm / 100));
+}
 /** 数値が有限かつ0以上であればそのまま、そうでなければ0を返す */
 function safeNonNegative(value) {
     return typeof value === 'number' && Number.isFinite(value) && value > 0 ? value : 0;
@@ -2302,6 +2461,10 @@ function DualMap({ engine, mapboxToken, darkMode, centerLat, centerLng, routePoi
         type: 'FeatureCollection',
         features: logs
             .filter((log) => {
+            if (log.inHomeZone)
+                return false;
+            if (!Number.isFinite(log.lat) || !Number.isFinite(log.lng))
+                return false;
             if (includeAll)
                 return true;
             if (layer === 'freshness')
@@ -2329,7 +2492,7 @@ function DualMap({ engine, mapboxToken, darkMode, centerLat, centerLng, routePoi
     const createEncountersGeoJson = (items = []) => ({
         type: 'FeatureCollection',
         features: items
-            .filter((item) => Number.isFinite(item.lat) && Number.isFinite(item.lng))
+            .filter((item) => !item.inHomeZone && Number.isFinite(item.lat) && Number.isFinite(item.lng))
             .map((item) => ({
             type: 'Feature',
             properties: {
@@ -3156,7 +3319,7 @@ function formatComparisonPercentLabel(percent) {
     const sign = percent > 0 ? '+' : '';
     return `${sign}${percent.toFixed(1)}%`;
 }
-function StatsDashboard({ walks, darkMode, initialPeriod = 'all', initialTrendGranularity = 'weekly', onSelectWalk, }) {
+function StatsDashboard({ walks, darkMode, ownerStrideCm, initialPeriod = 'all', initialTrendGranularity = 'weekly', onSelectWalk, }) {
     const [period, setPeriod] = useState(initialPeriod);
     const [trendGranularity, setTrendGranularity] = useState(initialTrendGranularity);
     const stats = useMemo(() => calculateWalkStats(walks, period), [walks, period]);
@@ -3178,6 +3341,7 @@ function StatsDashboard({ walks, darkMode, initialPeriod = 'all', initialTrendGr
             statCalTile: 'bg-rose-900/30 border border-rose-800/40 text-rose-300',
             statPeeTile: 'bg-sky-900/30 border border-sky-800/40 text-sky-300',
             statPoopTile: 'bg-violet-900/30 border border-violet-800/40 text-violet-300',
+            statStepTile: 'bg-teal-900/30 border border-teal-800/40 text-teal-300',
             barTrack: 'bg-[#1C1A27] border border-[#3A3450]',
             barFill: 'bg-[#FFD15C]',
             compareUpBadge: 'bg-emerald-900/40 border border-emerald-700/50 text-emerald-300',
@@ -3213,6 +3377,7 @@ function StatsDashboard({ walks, darkMode, initialPeriod = 'all', initialTrendGr
             statCalTile: 'bg-rose-50 border border-rose-100 text-rose-600',
             statPeeTile: 'bg-sky-50 border border-sky-100 text-sky-700',
             statPoopTile: 'bg-violet-50 border border-violet-100 text-violet-700',
+            statStepTile: 'bg-teal-50 border border-teal-100 text-teal-700',
             barTrack: 'bg-amber-100/60 border border-amber-200/60',
             barFill: 'bg-[#F5C445]',
             compareUpBadge: 'bg-emerald-50 border border-emerald-200 text-emerald-700',
@@ -3232,6 +3397,8 @@ function StatsDashboard({ walks, darkMode, initialPeriod = 'all', initialTrendGr
             divider: 'border-orange-100',
         }, [darkMode]);
     const { summary, bests, streak, trends, patterns, poop, milestone } = stats;
+    const totalEstimatedSteps = estimateSteps(summary.totalDistanceMeters, ownerStrideCm);
+    const avgEstimatedSteps = estimateSteps(summary.avgDistanceMeters, ownerStrideCm);
     const sniffRatioClamped = Number.isFinite(summary.sniffRatioPercent)
         ? Math.min(100, Math.max(0, summary.sniffRatioPercent))
         : 0;
@@ -3327,7 +3494,15 @@ function StatsDashboard({ walks, darkMode, initialPeriod = 'all', initialTrendGr
                         React.createElement("span", { className: "text-[11px] font-medium block" }, "\uD83D\uDCA9 \u3046\u3093\u3061\u5408\u8A08"),
                         React.createElement("p", { className: "text-base font-bold tabular-nums mt-0.5" },
                             summary.totalPoopCount.toLocaleString('ja-JP'),
-                            " \u56DE")))),
+                            " \u56DE")),
+                    React.createElement("div", { className: `col-span-2 p-3 rounded-2xl flex items-center justify-between gap-2 ${ui.statStepTile}` },
+                        React.createElement("span", { className: "text-[11px] font-medium flex items-center gap-1.5" },
+                            React.createElement("span", null, "\uD83D\uDC63"),
+                            React.createElement("span", null, "\u63A8\u5B9A\u6B69\u6570\uFF08\u7D2F\u8A08\uFF09")),
+                        React.createElement("p", { className: "text-base font-bold tabular-nums whitespace-nowrap" },
+                            "\u7D04",
+                            totalEstimatedSteps.toLocaleString('ja-JP'),
+                            "\u6B69")))),
             React.createElement("div", { className: `p-4 rounded-3xl flex flex-col gap-3 ${ui.card}` },
                 React.createElement("h3", { className: `text-sm font-bold flex items-center gap-1.5 ${ui.textPrimary}` },
                     React.createElement("span", null, "\u26A1"),
@@ -3344,7 +3519,15 @@ function StatsDashboard({ walks, darkMode, initialPeriod = 'all', initialTrendGr
                         React.createElement("p", { className: `text-base font-bold tabular-nums mt-0.5 ${ui.textPrimary}` }, formatDurationLabel(summary.avgSniffDurationSec))),
                     React.createElement("div", { className: `p-3 rounded-2xl ${ui.statSniffTile}` },
                         React.createElement("span", { className: "text-[11px] font-medium block" }, "\uD83D\uDD0D \u30AF\u30F3\u6D3B\u6BD4\u7387"),
-                        React.createElement("p", { className: "text-base font-bold tabular-nums mt-0.5" }, formatPercentLabel(summary.sniffRatioPercent)))),
+                        React.createElement("p", { className: "text-base font-bold tabular-nums mt-0.5" }, formatPercentLabel(summary.sniffRatioPercent))),
+                    React.createElement("div", { className: `col-span-2 p-3 rounded-2xl flex items-center justify-between gap-2 ${ui.statStepTile}` },
+                        React.createElement("span", { className: "text-[11px] font-medium flex items-center gap-1.5" },
+                            React.createElement("span", null, "\uD83D\uDC63"),
+                            React.createElement("span", null, "1\u56DE\u3042\u305F\u308A\u306E\u63A8\u5B9A\u6B69\u6570")),
+                        React.createElement("p", { className: "text-base font-bold tabular-nums whitespace-nowrap" },
+                            "\u7D04",
+                            avgEstimatedSteps.toLocaleString('ja-JP'),
+                            "\u6B69"))),
                 React.createElement("div", { className: `p-3 rounded-2xl flex flex-col gap-1.5 ${ui.subCard}` },
                     React.createElement("div", { className: "flex items-center justify-between text-[11px]" },
                         React.createElement("span", { className: ui.textSecondary }, "\u6563\u6B69\u6642\u9593\u306E\u3046\u3061\u30AF\u30F3\u6D3B\u3057\u3066\u3044\u305F\u5272\u5408"),
@@ -4116,10 +4299,17 @@ function EncounterQuickSheet({ encounter, mode, darkMode, isSaving = false, onSa
                             React.createElement("span", null, "\u3059\u308C\u9055\u3063\u305F\u308F\u3093\u3061\u3083\u3093")),
                         React.createElement("span", { className: `text-xs font-mono tabular-nums ${darkMode ? 'text-[#B8AFA3]' : 'text-stone-500'}` },
                             "\uD83D\uDD52 ",
-                            encounterSheetFormatTimestamp(encounter.timestamp))),
-                    React.createElement("p", { className: `text-[11px] ${darkMode ? 'text-[#B8AFA3]' : 'text-stone-500'}` }, mode === 'walk'
-                        ? '場所は記録済みです（入力中もGPS・タイマーは動き続けます）'
-                        : '後から名前や特徴を追記・修正できます')),
+                            encounterSheetFormatTimestamp(encounter.timestamp)),
+                        encounter.inHomeZone && (React.createElement("span", { className: `text-[10px] font-bold px-2 py-0.5 rounded-full border ${darkMode
+                                ? 'bg-emerald-950/60 text-emerald-300 border-emerald-700/60'
+                                : 'bg-emerald-50 text-emerald-700 border-emerald-200'}` }, "\uD83C\uDFE0 \u304A\u3046\u3061\u5468\u8FBA\uFF08\u5730\u56F3\u975E\u8868\u793A\uFF09"))),
+                    React.createElement("p", { className: `text-[11px] ${darkMode ? 'text-[#B8AFA3]' : 'text-stone-500'}` }, encounter.inHomeZone
+                        ? mode === 'walk'
+                            ? '🏠 おうち周辺として記録済みです（地図には表示されません・入力中も計測は続きます）'
+                            : '🏠 おうち周辺の記録（地図には表示されません）・後から追記・修正できます'
+                        : mode === 'walk'
+                            ? '場所は記録済みです（入力中もGPS・タイマーは動き続けます）'
+                            : '後から名前や特徴を追記・修正できます')),
                 React.createElement("button", { type: "button", onClick: handleDismiss, disabled: isSaving, "aria-label": "\u3068\u3058\u308B", className: `min-h-[40px] min-w-[40px] rounded-full text-sm font-bold flex items-center justify-center active:scale-95 transition ${darkMode
                         ? 'bg-[#3A3450] text-[#F5EFE6] hover:bg-[#484163]'
                         : 'bg-orange-50 text-stone-600 hover:bg-orange-100'}` }, "\u2715")),
@@ -4166,14 +4356,42 @@ const POOP_CONDITION_OPTIONS = [
     { value: 'soft', label: '軟便' },
     { value: 'hard', label: '硬め' },
 ];
-function createWalkDogEncounter(lat, lng) {
+function createWalkDogEncounter(lat, lng, inHomeZone) {
     const now = Date.now();
     return {
         id: `enc_${now}`,
         timestamp: now,
         lat,
         lng,
+        ...(inHomeZone ? { inHomeZone: true } : {}),
     };
+}
+function summarizeWalkHomeZoneCounts(logs, encounters) {
+    let poop = 0;
+    let pee = 0;
+    let sniff = 0;
+    for (const log of logs) {
+        if (!log.inHomeZone)
+            continue;
+        if (log.type === 'poop')
+            poop += 1;
+        else if (log.type === 'pee')
+            pee += 1;
+        else if (log.type === 'sniff_manual' || log.type === 'sniff_auto')
+            sniff += 1;
+    }
+    let encounter = 0;
+    if (Array.isArray(encounters)) {
+        for (const enc of encounters) {
+            if (enc.inHomeZone)
+                encounter += 1;
+        }
+    }
+    return { poop, pee, sniff, encounter, total: poop + pee + sniff + encounter };
+}
+function formatWalkHomeZoneBadgeText(counts) {
+    const base = `🏠 おうち周辺: うんち${counts.poop}・おしっこ${counts.pee}・クン活${counts.sniff}`;
+    return counts.encounter > 0 ? `${base}・すれ違い${counts.encounter}` : base;
 }
 function KunKatsuApp() {
     const [activeTab, setActiveTab] = useState('walk');
@@ -4216,6 +4434,7 @@ function KunKatsuApp() {
             statDistTile: 'bg-orange-900/30 border border-orange-800/40 text-[#FF8A65]',
             statSniffTile: 'bg-amber-900/30 border border-amber-800/40 text-amber-300',
             statCalTile: 'bg-rose-900/30 border border-rose-800/40 text-rose-300',
+            statStepTile: 'bg-teal-900/30 border border-teal-800/40 text-teal-300',
             // 通知・トースト・成功表示
             mintBadge: 'bg-emerald-900/40 border border-emerald-700/50 text-emerald-300',
             toastWarn: 'bg-amber-950/80 border border-amber-700/50 text-amber-200',
@@ -4265,6 +4484,7 @@ function KunKatsuApp() {
             statDistTile: 'bg-orange-50 border border-orange-100 text-[#F0653A]',
             statSniffTile: 'bg-amber-50 border border-amber-100 text-amber-800',
             statCalTile: 'bg-rose-50 border border-rose-100 text-rose-600',
+            statStepTile: 'bg-teal-50 border border-teal-100 text-teal-700',
             // 通知・トースト・成功表示
             mintBadge: 'bg-emerald-50 border border-emerald-200 text-emerald-700',
             toastWarn: 'bg-amber-50 border border-amber-200 text-amber-800',
@@ -4318,6 +4538,7 @@ function KunKatsuApp() {
     const [walkSuggestedFocusPoint, setWalkSuggestedFocusPoint] = useState(null);
     const [dogWeightDraft, setDogWeightDraft] = useState('28');
     const [ownerWeightDraft, setOwnerWeightDraft] = useState('65');
+    const [ownerStrideDraft, setOwnerStrideDraft] = useState('70');
     const [geofenceRadiusDraft, setGeofenceRadiusDraft] = useState('200');
     const [staleRouteDaysDraft, setStaleRouteDaysDraft] = useState(String(ROUTE_FRESHNESS_DEFAULT_STALE_DAYS));
     const [toastMessage, setToastMessage] = useState(null);
@@ -4385,6 +4606,15 @@ function KunKatsuApp() {
     };
     const commitNumericProfileField = (raw, field, min, max, fallback, decimals, setDraft) => {
         const clamped = clampProfileNumber(raw, min, max, fallback, decimals);
+        const latestProfile = profileRef.current ?? profile;
+        if (field === 'geofenceRadiusMeters' &&
+            latestProfile &&
+            latestProfile.homeLat !== null &&
+            latestProfile.homeLng !== null &&
+            isInsideHomeGeofence(currentLat, currentLng, latestProfile.homeLat, latestProfile.homeLng, clamped)) {
+            setCurrentLat(latestProfile.homeLat);
+            setCurrentLng(latestProfile.homeLng);
+        }
         setProfile((prev) => (prev ? { ...prev, [field]: clamped } : prev));
         setDraft(String(clamped));
     };
@@ -4416,6 +4646,8 @@ function KunKatsuApp() {
     }, [profile]);
     const slowStartTimestampRef = useRef(null);
     const lastPointRef = useRef(null);
+    const distanceTrackerRef = useRef(distanceTrackerCreateState());
+    const simCoordRef = useRef(null);
     const holdIntervalRef = useRef(null);
     const wakeLockRef = useRef(null);
     // 初期化・プロフィール取得・現在地取得
@@ -4427,6 +4659,7 @@ function KunKatsuApp() {
             setProfile(loadedProfile);
             setDogWeightDraft(String(loadedProfile.weightKg));
             setOwnerWeightDraft(String(loadedProfile.ownerWeightKg));
+            setOwnerStrideDraft(String(loadedProfile.ownerStrideCm ?? 70));
             setGeofenceRadiusDraft(String(loadedProfile.geofenceRadiusMeters));
             setStaleRouteDaysDraft(String(loadedProfile.staleRouteDays ?? ROUTE_FRESHNESS_DEFAULT_STALE_DAYS));
             const walks = await getAllWalks();
@@ -4564,25 +4797,33 @@ function KunKatsuApp() {
             const isStoppingToSniff = Math.random() < 0.35;
             const stepLat = isStoppingToSniff ? 0.000005 : (Math.random() - 0.3) * 0.00012;
             const stepLng = isStoppingToSniff ? 0.000005 : (Math.random() - 0.3) * 0.00012;
-            handleNewCoordinate(currentLat + stepLat, currentLng + stepLng, Date.now());
+            const base = simCoordRef.current ?? { lat: currentLat, lng: currentLng };
+            const nextLat = base.lat + stepLat;
+            const nextLng = base.lng + stepLng;
+            simCoordRef.current = { lat: nextLat, lng: nextLng };
+            handleNewCoordinate(nextLat, nextLng, Date.now(), 5);
         }, 2000);
         return () => clearInterval(simTimer);
-    }, [isWalking, isSimulating, currentLat, currentLng]);
+    }, [isWalking, isSimulating, profile]);
     // 実機GPS監視
     useEffect(() => {
         if (!isWalking || isSimulating || !('geolocation' in navigator))
             return;
         const watchId = navigator.geolocation.watchPosition((pos) => {
-            handleNewCoordinate(pos.coords.latitude, pos.coords.longitude, pos.timestamp);
+            handleNewCoordinate(pos.coords.latitude, pos.coords.longitude, pos.timestamp, pos.coords.accuracy);
         }, () => { }, { enableHighAccuracy: true, maximumAge: 1000 });
         return () => navigator.geolocation.clearWatch(watchId);
     }, [isWalking, isSimulating, profile]);
     // 座標受信ハンドラ（StrictMode 二重加算バグ防止のため updater 外で副作用を処理）
-    const handleNewCoordinate = (lat, lng, timestamp) => {
+    const handleNewCoordinate = (lat, lng, timestamp, accuracy) => {
         const now = Date.now();
         lastGpsReceivedAtRef.current = now;
         setLastGpsReceivedAt(now);
         setSecondsSinceLastGps(0);
+        // 距離トラッカーをジオフェンス判定より前に更新（メモリ上のみ積算し、自宅範囲内の生座標は保存しない）
+        const nextTrackerState = distanceTrackerStep(distanceTrackerRef.current, lat, lng, timestamp, accuracy);
+        distanceTrackerRef.current = nextTrackerState;
+        setDistanceMeters(Math.round(nextTrackerState.totalMeters));
         // 自宅防犯マスク判定（半径内は座標データそのものを即時破棄し、現在地表示もオフセット中心に固定）
         if (profile &&
             isInsideHomeGeofence(lat, lng, profile.homeLat, profile.homeLng, profile.geofenceRadiusMeters)) {
@@ -4590,6 +4831,7 @@ function KunKatsuApp() {
                 setCurrentLat(profile.homeLat);
                 setCurrentLng(profile.homeLng);
             }
+            slowStartTimestampRef.current = null;
             setGeofenceMaskedCount((c) => c + 1);
             return;
         }
@@ -4602,9 +4844,6 @@ function KunKatsuApp() {
             dist = calculateDistanceMeters(last.lat, last.lng, lat, lng);
             const timeDiff = timestamp - last.timestamp;
             speedKmh = calculateSpeedKmh(dist, timeDiff);
-            if (dist >= 0.5) {
-                setDistanceMeters((d) => Math.round(d + dist));
-            }
             // クン活自動判定（時速1.0km以下、5〜90秒滞在）
             if (speedKmh <= 1.0) {
                 if (!slowStartTimestampRef.current) {
@@ -4726,29 +4965,34 @@ function KunKatsuApp() {
     const handleManualAction = (type) => {
         if (!isWalking)
             return;
-        if (profile &&
-            isInsideHomeGeofence(currentLat, currentLng, profile.homeLat, profile.homeLng, profile.geofenceRadiusMeters)) {
-            showToast('🛡️ 自宅マスク範囲内（防犯保護のため記録スキップ）');
-            return;
-        }
+        const inHomeZone = Boolean(profile &&
+            profile.homeLat !== null &&
+            profile.homeLng !== null &&
+            isInsideHomeGeofence(currentLat, currentLng, profile.homeLat, profile.homeLng, profile.geofenceRadiusMeters));
+        const recordLat = inHomeZone && profile?.homeLat != null ? profile.homeLat : currentLat;
+        const recordLng = inHomeZone && profile?.homeLng != null ? profile.homeLng : currentLng;
         const now = Date.now();
         const logId = `manual_${now}`;
         const newLog = {
             id: logId,
             walkId: 'current',
             timestamp: now,
-            lat: currentLat,
-            lng: currentLng,
+            lat: recordLat,
+            lng: recordLng,
             type,
             durationSec: type === 'sniff_manual' ? 15 : 10,
             weight: 3,
             poopCondition: undefined,
+            ...(inHomeZone ? { inHomeZone: true } : {}),
         };
         if (type === 'sniff_manual') {
             setSniffTotalSec((s) => s + 15);
         }
         setActionLogs((prev) => [...prev, newLog]);
         setUndoTargetId(logId);
+        if (inHomeZone) {
+            showToast('🏠 おうち周辺として記録しました（地図には表示されません）');
+        }
         // 記録確定後にフィードバックを発火（失敗しても記録に影響しない）
         triggerCompletionFeedback(type);
         clearUndoTimer();
@@ -4807,15 +5051,19 @@ function KunKatsuApp() {
     const handleRecordEncounter = () => {
         if (!isWalking)
             return;
-        if (profile &&
-            isInsideHomeGeofence(currentLat, currentLng, profile.homeLat, profile.homeLng, profile.geofenceRadiusMeters)) {
-            showToast('🛡️ 自宅マスク範囲内（防犯保護のため記録スキップ）');
-            return;
-        }
-        const newEncounter = createWalkDogEncounter(currentLat, currentLng);
+        const inHomeZone = Boolean(profile &&
+            profile.homeLat !== null &&
+            profile.homeLng !== null &&
+            isInsideHomeGeofence(currentLat, currentLng, profile.homeLat, profile.homeLng, profile.geofenceRadiusMeters));
+        const recordLat = inHomeZone && profile?.homeLat != null ? profile.homeLat : currentLat;
+        const recordLng = inHomeZone && profile?.homeLng != null ? profile.homeLng : currentLng;
+        const newEncounter = createWalkDogEncounter(recordLat, recordLng, inHomeZone);
         setEncounters((prev) => [...prev, newEncounter]);
         triggerVibration(35);
         setActiveWalkEncounterId(newEncounter.id);
+        if (inHomeZone) {
+            showToast('🏠 おうち周辺として記録しました（地図には表示されません）');
+        }
     };
     const startWalk = (withSimulator = false) => {
         const now = Date.now();
@@ -4836,6 +5084,8 @@ function KunKatsuApp() {
         setActiveWalkEncounterId(null);
         setGeofenceMaskedCount(0);
         lastPointRef.current = null;
+        distanceTrackerRef.current = distanceTrackerCreateState();
+        simCoordRef.current = withSimulator ? { lat: currentLat, lng: currentLng } : null;
         slowStartTimestampRef.current = null;
         hiddenStartTimestampRef.current = null;
         totalInterruptedSecRef.current = 0;
@@ -4851,6 +5101,7 @@ function KunKatsuApp() {
         const endTime = Date.now();
         const startTime = walkStartTimeRef.current ?? endTime - elapsedSec * 1000;
         const finalDurationSec = Math.max(1, Math.round((endTime - startTime) / 1000));
+        const finalDistanceMeters = Math.round(distanceTrackerRef.current.totalMeters);
         clearUndoTimer();
         clearPoopSelectorTimers();
         setUndoTargetId(null);
@@ -4861,9 +5112,12 @@ function KunKatsuApp() {
         setIsSimulating(false);
         setPocketLock(false);
         lastPointRef.current = null;
+        distanceTrackerRef.current = distanceTrackerCreateState();
+        simCoordRef.current = null;
         slowStartTimestampRef.current = null;
         walkStartTimeRef.current = null;
         setElapsedSec(finalDurationSec);
+        setDistanceMeters(finalDistanceMeters);
         const walkId = `walk_${endTime}`;
         const ownerWeight = profile?.ownerWeightKg || 65;
         const startWeather = walkStartWeatherRef.current;
@@ -4872,7 +5126,7 @@ function KunKatsuApp() {
             id: walkId,
             startTime,
             endTime,
-            distanceMeters,
+            distanceMeters: finalDistanceMeters,
             durationSec: finalDurationSec,
             sniffDurationSec: sniffTotalSec,
             ownerCaloriesKcal: calculateOwnerCalories(finalDurationSec, ownerWeight),
@@ -4883,10 +5137,11 @@ function KunKatsuApp() {
             backgroundInterruptedSec: totalInterruptedSecRef.current,
             ...(startWeather ? { weather: startWeather } : {}),
         };
-        await saveWalkSession(completedWalk);
+        const safeCompletedWalk = sanitizeWalkForHomeZone(completedWalk, profileRef.current ?? profile);
+        await saveWalkSession(safeCompletedWalk);
         const walks = await getAllWalks();
         setAllWalks(walks);
-        selectWalk(completedWalk.id);
+        selectWalk(safeCompletedWalk.id);
         switchTab('summary');
     };
     // 散歩終了長押しハンドラ
@@ -4940,15 +5195,16 @@ function KunKatsuApp() {
         ? memoEdit.text
         : (currentWalk?.memo ?? '');
     const buildShareCacheKey = (walk, dogName) => {
-        const logsSig = walk.actionLogs
+        const visibleLogs = walk.actionLogs.filter((l) => !l.inHomeZone);
+        const logsSig = visibleLogs
             .map((l) => `${l.id}:${l.type}:${l.poopCondition ?? ''}`)
             .join(',');
-        return `${walk.id}:${walk.memo}:${walk.safePhotoDataUrl ?? ''}:${dogName}:${walk.sniffDurationSec}:${walk.actionLogs.length}:${logsSig}`;
+        return `${walk.id}:${walk.memo}:${walk.safePhotoDataUrl ?? ''}:${dogName}:${walk.sniffDurationSec}:${visibleLogs.length}:${logsSig}`;
     };
     const editingActionLog = useMemo(() => {
         if (!currentWalk || !editingActionLogId)
             return null;
-        return currentWalk.actionLogs.find((l) => l.id === editingActionLogId) ?? null;
+        return currentWalk.actionLogs.find((l) => l.id === editingActionLogId && !l.inHomeZone) ?? null;
     }, [currentWalk, editingActionLogId]);
     const handleUpdateActionPoopCondition = async (logId, condition) => {
         if (!currentWalk || isSavingActionEdit)
@@ -5268,9 +5524,9 @@ function KunKatsuApp() {
             };
         }
     }, [activeTab, currentWalk, currentShareCacheKey, currentDogName]);
-    // 実測クン活スポットTop3の自動クラスタリング集計
+    // 実測クン活スポットTop3の自動クラスタリング集計（自宅周辺除外）
     const topSniffSpots = useMemo(() => {
-        const sniffs = filteredWalks.flatMap((w) => w.actionLogs.filter((l) => l.type === 'sniff_auto' || l.type === 'sniff_manual'));
+        const sniffs = filteredWalks.flatMap((w) => w.actionLogs.filter((l) => !l.inHomeZone && (l.type === 'sniff_auto' || l.type === 'sniff_manual')));
         if (sniffs.length === 0)
             return [];
         // 緯度経度を小数第4位（約10mメッシュ）でグループ化し、重心平均を算出
@@ -5300,6 +5556,13 @@ function KunKatsuApp() {
         lng: spot.lng,
         rank: (idx + 1),
     })), [topSniffSpots]);
+    const walkMapActionLogs = useMemo(() => actionLogs.filter((l) => !l.inHomeZone), [actionLogs]);
+    const walkMapEncounters = useMemo(() => encounters.filter((e) => !e.inHomeZone), [encounters]);
+    const summaryMapActionLogs = useMemo(() => (currentWalk ? currentWalk.actionLogs.filter((l) => !l.inHomeZone) : []), [currentWalk]);
+    const summaryMapEncounters = useMemo(() => (currentWalk?.encounters ? currentWalk.encounters.filter((e) => !e.inHomeZone) : []), [currentWalk]);
+    const heatmapMapActionLogs = useMemo(() => filteredWalks.flatMap((w) => w.actionLogs.filter((l) => !l.inHomeZone)), [filteredWalks]);
+    const activeWalkHomeCounts = useMemo(() => summarizeWalkHomeZoneCounts(actionLogs, encounters), [actionLogs, encounters]);
+    const currentWalkHomeCounts = useMemo(() => currentWalk ? summarizeWalkHomeZoneCounts(currentWalk.actionLogs, currentWalk.encounters) : null, [currentWalk]);
     const handleFocusTopSpot = (spot) => {
         setHeatmapFocusPoint((prev) => ({
             lat: spot.lat,
@@ -5468,6 +5731,10 @@ function KunKatsuApp() {
                     React.createElement("div", null,
                         React.createElement("span", { className: "text-[10px] text-[#8E857B] block" }, "\uD83D\uDC43 \u30AF\u30F3\u6D3B"),
                         React.createElement("p", { className: "text-lg font-bold tabular-nums text-[#F5EFE6] mt-0.5" }, formatTime(sniffTotalSec)))),
+                React.createElement("p", { className: "text-xs font-semibold tabular-nums text-[#B8AFA3]" },
+                    "\uD83D\uDC63 \u63A8\u5B9A\u6B69\u6570 \u7D04",
+                    estimateSteps(distanceMeters, profile?.ownerStrideCm).toLocaleString('ja-JP'),
+                    "\u6B69"),
                 React.createElement("div", { className: "mt-1" },
                     React.createElement("span", { className: `text-[10px] tabular-nums px-2.5 py-0.5 rounded-full transition-colors ${secondsSinceLastGps >= 15
                             ? 'bg-rose-950/80 text-rose-300 border border-rose-800'
@@ -5489,7 +5756,7 @@ function KunKatsuApp() {
                     React.createElement("span", null, "\uD83D\uDD12"),
                     " \u30DD\u30B1\u30C3\u30C8\u30ED\u30C3\u30AF")),
                 React.createElement("button", { onClick: () => setDarkMode(!darkMode), className: `p-2 rounded-full ${theme.themeToggleBtn} text-xs transition-colors`, title: "\u30C6\u30FC\u30DE\u5207\u66FF" }, darkMode ? '☀️' : '🌙'))),
-        !pocketLock && toastMessage && (React.createElement("div", { className: "fixed top-16 left-1/2 -translate-x-1/2 z-50 w-[calc(100%-2rem)] max-w-md pointer-events-none" },
+        !pocketLock && toastMessage && (React.createElement("div", { className: "fixed top-16 left-1/2 -translate-x-1/2 z-[60] w-[calc(100%-2rem)] max-w-md pointer-events-none" },
             React.createElement("div", { role: "status", "aria-live": "polite", className: `px-3.5 py-2.5 rounded-2xl text-center text-xs font-medium shadow-lg backdrop-blur animate-fade-in ${theme.toastWarn}` }, toastMessage))),
         activeTab === 'walk' && (React.createElement("section", { className: "p-4 flex flex-col gap-3" },
             React.createElement("div", { className: "grid grid-cols-3 gap-2" },
@@ -5503,13 +5770,21 @@ function KunKatsuApp() {
                         "m")),
                 React.createElement("div", { className: `p-2.5 rounded-2xl text-center border ${theme.statSniffTile}` },
                     React.createElement("span", { className: "text-[11px] font-medium block" }, "\uD83D\uDC43 \u30AF\u30F3\u6D3B"),
-                    React.createElement("p", { className: "text-lg font-bold tabular-nums mt-0.5" }, formatTime(sniffTotalSec)))),
+                    React.createElement("p", { className: "text-lg font-bold tabular-nums mt-0.5" }, formatTime(sniffTotalSec))),
+                React.createElement("div", { className: `col-span-3 px-3 py-2 rounded-2xl border flex items-center justify-between gap-2 ${theme.statStepTile}` },
+                    React.createElement("span", { className: "text-[11px] font-medium flex items-center gap-1.5" },
+                        React.createElement("span", null, "\uD83D\uDC63"),
+                        React.createElement("span", null, "\u63A8\u5B9A\u6B69\u6570")),
+                    React.createElement("p", { className: "text-sm font-bold tabular-nums whitespace-nowrap" },
+                        "\u7D04",
+                        estimateSteps(distanceMeters, profile?.ownerStrideCm).toLocaleString('ja-JP'),
+                        "\u6B69"))),
             React.createElement("div", { ref: walkMapContainerRef, className: "h-64 w-full" },
                 React.createElement(DualMap, { engine: mapEngine, mapboxToken: profile?.mapboxPublicToken || '', darkMode: darkMode, centerLat: !isWalking && selectedSuggestedCourse
                         ? selectedSuggestedCourse.centerLat
                         : currentLat, centerLng: !isWalking && selectedSuggestedCourse
                         ? selectedSuggestedCourse.centerLng
-                        : currentLng, routePoints: routePoints, actionLogs: actionLogs, encounters: encounters, activeLayer: "sniff", suggestedRoutePoints: !isWalking && selectedSuggestedCourse
+                        : currentLng, routePoints: routePoints, actionLogs: walkMapActionLogs, encounters: walkMapEncounters, activeLayer: "sniff", suggestedRoutePoints: !isWalking && selectedSuggestedCourse
                         ? selectedSuggestedCourse.routePoints
                         : null, focusPoint: !isWalking ? walkSuggestedFocusPoint : null })),
             !isWalking && selectedSuggestedCourse && (React.createElement("div", { className: `px-3 py-1.5 rounded-2xl border text-[11px] flex items-center justify-between gap-2 ${darkMode
@@ -5528,6 +5803,9 @@ function KunKatsuApp() {
                 "\uD83C\uDFE0 \u304A\u3046\u3061\u306E\u307E\u308F\u308A: ",
                 geofenceMaskedCount,
                 "\u500B\u306E\u4F4D\u7F6E\u3092\u81EA\u52D5\u3067\u304B\u304F\u3057\u3066\u3044\u307E\u3059")),
+            isWalking && activeWalkHomeCounts.total > 0 && (React.createElement("p", { className: `text-[11px] ${theme.textSecondary} text-center` },
+                formatWalkHomeZoneBadgeText(activeWalkHomeCounts),
+                "\uFF08\u5730\u56F3\u306B\u306F\u975E\u8868\u793A\uFF09")),
             !isWalking ? (React.createElement("div", { className: "flex flex-col gap-3 mt-1" },
                 React.createElement(WeatherCard, { snapshot: weatherSnapshot, loading: isWeatherLoading, error: weatherError, dog: profile, darkMode: darkMode, onRefresh: () => {
                         void loadWeather(currentLat, currentLng, true);
@@ -5641,9 +5919,11 @@ function KunKatsuApp() {
                     currentWalk.weather && (React.createElement("div", { className: `pt-1.5 border-t text-center text-[11px] font-medium tabular-nums truncate ${darkMode ? 'border-[#3A3450] text-[#B8AFA3]' : 'border-orange-100 text-stone-600'}` }, formatWalkWeatherBadge(currentWalk.weather)))),
                 React.createElement("div", { className: `p-4 rounded-3xl flex flex-col gap-3 ${theme.card}` },
                     React.createElement("div", { className: "h-64 w-full rounded-2xl overflow-hidden border border-orange-100/50" },
-                        React.createElement(DualMap, { engine: mapEngine, mapboxToken: profile?.mapboxPublicToken || '', darkMode: darkMode, centerLat: summaryCenter.lat, centerLng: summaryCenter.lng, routePoints: currentWalk.routePoints, actionLogs: currentWalk.actionLogs, encounters: currentWalk.encounters, activeLayer: "sniff", showAllActionPoints: true, onActionTap: (logId) => setEditingActionLogId(logId), onEncounterTap: (encounterId) => setEditingSummaryEncounterId(encounterId) })),
-                    (currentWalk.actionLogs.length > 0 ||
-                        (currentWalk.encounters && currentWalk.encounters.length > 0)) && (React.createElement("p", { className: `text-[11px] text-center ${theme.textMuted}` }, "\uD83D\uDCA1 \u5730\u56F3\u4E0A\u306E\u4E38\u5370\u3092\u30BF\u30C3\u30D7\u3059\u308B\u3068\u78BA\u8A8D\u30FB\u7DE8\u96C6\u30FB\u524A\u9664\u304C\u3067\u304D\u307E\u3059\uFF08\u7DD1\u306F\u3059\u308C\u9055\u3044\uFF09")),
+                        React.createElement(DualMap, { engine: mapEngine, mapboxToken: profile?.mapboxPublicToken || '', darkMode: darkMode, centerLat: summaryCenter.lat, centerLng: summaryCenter.lng, routePoints: currentWalk.routePoints, actionLogs: summaryMapActionLogs, encounters: summaryMapEncounters, activeLayer: "sniff", showAllActionPoints: true, onActionTap: (logId) => setEditingActionLogId(logId), onEncounterTap: (encounterId) => setEditingSummaryEncounterId(encounterId) })),
+                    (summaryMapActionLogs.length > 0 || summaryMapEncounters.length > 0) && (React.createElement("p", { className: `text-[11px] text-center ${theme.textMuted}` }, "\uD83D\uDCA1 \u5730\u56F3\u4E0A\u306E\u4E38\u5370\u3092\u30BF\u30C3\u30D7\u3059\u308B\u3068\u78BA\u8A8D\u30FB\u7DE8\u96C6\u30FB\u524A\u9664\u304C\u3067\u304D\u307E\u3059\uFF08\u7DD1\u306F\u3059\u308C\u9055\u3044\uFF09")),
+                    currentWalkHomeCounts && currentWalkHomeCounts.total > 0 && (React.createElement("div", { className: `px-3 py-2 rounded-2xl border text-[11px] font-medium flex items-center justify-between gap-2 flex-wrap ${theme.mintBadge}` },
+                        React.createElement("span", null, formatWalkHomeZoneBadgeText(currentWalkHomeCounts)),
+                        React.createElement("span", { className: "text-[10px] opacity-80 shrink-0" }, "\u5730\u56F3\u306B\u306F\u975E\u8868\u793A"))),
                     React.createElement("div", { className: "grid grid-cols-2 gap-2 text-xs" },
                         React.createElement("div", { className: `p-2.5 rounded-2xl border ${theme.statDistTile}` },
                             React.createElement("span", { className: "text-[11px] font-medium block" }, "\uD83D\uDC3E \u3042\u308B\u3044\u305F\u304D\u3087\u308A"),
@@ -5660,7 +5940,15 @@ function KunKatsuApp() {
                             React.createElement("span", { className: "text-[11px] font-medium block" }, "\uD83D\uDD25 \u98FC\u3044\u4E3B\u306E\u6D88\u8CBB"),
                             React.createElement("p", { className: "text-base font-bold tabular-nums mt-0.5" },
                                 currentWalk.ownerCaloriesKcal,
-                                " kcal"))),
+                                " kcal")),
+                        React.createElement("div", { className: `col-span-2 p-2.5 rounded-2xl border flex items-center justify-between gap-2 ${theme.statStepTile}` },
+                            React.createElement("span", { className: "text-[11px] font-medium flex items-center gap-1.5" },
+                                React.createElement("span", null, "\uD83D\uDC63"),
+                                React.createElement("span", null, "\u63A8\u5B9A\u6B69\u6570")),
+                            React.createElement("p", { className: "text-base font-bold tabular-nums whitespace-nowrap" },
+                                "\u7D04",
+                                estimateSteps(currentWalk.distanceMeters, profile?.ownerStrideCm).toLocaleString('ja-JP'),
+                                "\u6B69"))),
                     currentWalk.backgroundInterruptedSec && currentWalk.backgroundInterruptedSec > 0 ? (React.createElement("div", { className: `p-2.5 rounded-2xl flex items-center justify-between text-xs ${theme.toastWarn}` },
                         React.createElement("span", { className: "flex items-center gap-1.5" },
                             React.createElement("span", null, "\u26A0\uFE0F"),
@@ -5759,6 +6047,9 @@ function KunKatsuApp() {
                                     React.createElement("span", { className: `text-[11px] font-mono tabular-nums px-2 py-0.5 rounded-full border ${darkMode
                                             ? 'bg-emerald-950/60 text-emerald-200 border-emerald-700/50'
                                             : 'bg-emerald-50 text-emerald-800 border-emerald-200'}` }, timeStr),
+                                    enc.inHomeZone && (React.createElement("span", { className: `text-[10px] font-bold px-2 py-0.5 rounded-full border ${darkMode
+                                            ? 'bg-emerald-950/60 text-emerald-300 border-emerald-700/60'
+                                            : 'bg-emerald-50 text-emerald-700 border-emerald-200'}` }, "\uD83C\uDFE0 \u304A\u3046\u3061\u5468\u8FBA")),
                                     React.createElement("span", { className: `text-xs font-bold truncate ${hasName ? theme.textPrimary : theme.textSecondary}` }, hasName ? enc.name : '名前未設定（タップして追記）'),
                                     enc.breed && (React.createElement("span", { className: `text-[11px] px-2 py-0.5 rounded-full ${darkMode
                                             ? 'bg-[#3A3450] text-[#E6DDD0]'
@@ -5794,6 +6085,8 @@ function KunKatsuApp() {
                         const isExcluded = getWalkExclusionReason(walkItem) !== null;
                         const hasPhoto = Boolean(walkItem.safePhotoDataUrl);
                         const hasMemo = walkItem.memo.trim().length > 0;
+                        const hasHomeLogs = walkItem.actionLogs.some((l) => l.inHomeZone) ||
+                            (walkItem.encounters ?? []).some((e) => e.inHomeZone);
                         return (React.createElement("li", { key: walkItem.id },
                             React.createElement("button", { type: "button", onClick: () => {
                                     selectWalk(walkItem.id);
@@ -5807,13 +6100,21 @@ function KunKatsuApp() {
                                     : theme.subCard}` },
                                 React.createElement("div", { className: "min-w-0 flex flex-col gap-0.5" },
                                     React.createElement("span", { className: `text-xs font-bold tabular-nums ${theme.textPrimary}` }, formatSummaryDateTime(walkItem.startTime)),
-                                    React.createElement("span", { className: `text-[11px] tabular-nums ${theme.textSecondary}` },
-                                        "\uD83D\uDC3E ",
-                                        walkItem.distanceMeters,
-                                        " m \u30FB \u23F1\uFE0F ",
-                                        formatTime(walkItem.durationSec)),
+                                    React.createElement("span", { className: `text-[11px] tabular-nums flex flex-wrap items-center gap-x-2 gap-y-0.5 ${theme.textSecondary}` },
+                                        React.createElement("span", { className: "whitespace-nowrap" },
+                                            "\uD83D\uDC3E ",
+                                            walkItem.distanceMeters,
+                                            " m"),
+                                        React.createElement("span", { className: "whitespace-nowrap" },
+                                            "\u23F1\uFE0F ",
+                                            formatTime(walkItem.durationSec)),
+                                        React.createElement("span", { className: "whitespace-nowrap" },
+                                            "\uD83D\uDC63 \u63A8\u5B9A\u6B69\u6570 \u7D04",
+                                            estimateSteps(walkItem.distanceMeters, profile?.ownerStrideCm).toLocaleString('ja-JP'),
+                                            "\u6B69")),
                                     walkItem.weather && (React.createElement("span", { className: `text-[11px] tabular-nums truncate ${theme.textMuted}` }, formatWalkWeatherBadge(walkItem.weather)))),
                                 React.createElement("div", { className: "flex items-center gap-1 shrink-0 text-xs" },
+                                    hasHomeLogs && React.createElement("span", { title: "\u304A\u3046\u3061\u5468\u8FBA\u306E\u8A18\u9332\u3042\u308A" }, "\uD83C\uDFE0"),
                                     hasPhoto && React.createElement("span", { title: "\u5199\u771F\u3042\u308A" }, "\uD83D\uDCF7"),
                                     hasMemo && React.createElement("span", { title: "\u30E1\u30E2\u3042\u308A" }, "\uD83D\uDCDD"),
                                     isExcluded && (React.createElement("span", { title: "\u96C6\u8A08\u5BFE\u8C61\u5916\uFF08\u30C6\u30B9\u30C8\u30FB\u77ED\u6642\u9593\uFF09", className: `px-1.5 py-0.5 rounded-md text-[10px] font-semibold ${darkMode
@@ -5843,7 +6144,7 @@ function KunKatsuApp() {
                         React.createElement("span", { className: "w-2.5 h-2.5 rounded-full bg-blue-600 inline-block" }),
                         React.createElement("span", null, "\u3054\u3076\u3055\u305F"))))),
             React.createElement("div", { ref: heatmapMapContainerRef, className: "h-80 w-full rounded-2xl overflow-hidden border border-orange-100/50" },
-                React.createElement(DualMap, { engine: mapEngine, mapboxToken: profile?.mapboxPublicToken || '', darkMode: darkMode, centerLat: heatmapCenter.lat, centerLng: heatmapCenter.lng, routePoints: filteredWalks.flatMap((w) => w.routePoints), actionLogs: filteredWalks.flatMap((w) => w.actionLogs), activeLayer: heatmapLayer, rankedSpots: rankedHeatmapSpots, focusPoint: heatmapFocusPoint, freshnessCells: heatmapRouteFreshness.cells })),
+                React.createElement(DualMap, { engine: mapEngine, mapboxToken: profile?.mapboxPublicToken || '', darkMode: darkMode, centerLat: heatmapCenter.lat, centerLng: heatmapCenter.lng, routePoints: filteredWalks.flatMap((w) => w.routePoints), actionLogs: heatmapMapActionLogs, activeLayer: heatmapLayer, rankedSpots: rankedHeatmapSpots, focusPoint: heatmapFocusPoint, freshnessCells: heatmapRouteFreshness.cells })),
             React.createElement("div", { className: `p-3.5 rounded-2xl border ${theme.card} text-xs` },
                 React.createElement("div", { className: "flex items-center justify-between gap-2" },
                     React.createElement("span", { className: `font-bold block ${theme.textPrimary}` }, "\uD83D\uDCA1 \u304A\u6C17\u306B\u5165\u308A\u30AF\u30F3\u6D3B\u30B9\u30DD\u30C3\u30C8 Top3"),
@@ -5864,7 +6165,7 @@ function KunKatsuApp() {
                                 spot.count,
                                 "\u56DE \uD83D\uDD0D"))));
                 }))) : (React.createElement("p", { className: `text-[11px] mt-1 ${theme.textMuted}` }, "\u304A\u3055\u3093\u307D\u8A18\u9332\u304C\u5897\u3048\u308B\u3068\u3001\u3088\u304F\u7ACB\u3061\u5BC4\u308B\u5834\u6240\u304C\u81EA\u52D5\u3067\u30E9\u30F3\u30AD\u30F3\u30B0\u3055\u308C\u307E\u3059\u3002"))))),
-        activeTab === 'stats' && (React.createElement(StatsDashboard, { walks: allWalks, darkMode: darkMode, onSelectWalk: (walkId) => {
+        activeTab === 'stats' && (React.createElement(StatsDashboard, { walks: allWalks, darkMode: darkMode, ownerStrideCm: profile?.ownerStrideCm, onSelectWalk: (walkId) => {
                 selectWalk(walkId);
                 switchTab('summary');
                 if (typeof window !== 'undefined') {
@@ -5922,6 +6223,10 @@ function KunKatsuApp() {
                         React.createElement("label", { htmlFor: "owner-weight-input", className: `font-medium ${theme.textSecondary}` }, "\u98FC\u3044\u4E3B\u306E\u4F53\u91CD (kg)"),
                         React.createElement("input", { id: "owner-weight-input", type: "text", inputMode: "decimal", value: ownerWeightDraft, onChange: (e) => handleNumericDraftChange(e, setOwnerWeightDraft), onCompositionEnd: (e) => setOwnerWeightDraft(normalizeNumericDraft(e.currentTarget.value)), onBlur: (e) => commitNumericProfileField(e.currentTarget.value, 'ownerWeightKg', 20, 200, profile.ownerWeightKg, 1, setOwnerWeightDraft), className: `w-full px-3 py-2 rounded-xl text-xs font-bold tabular-nums ${theme.input}` }),
                         React.createElement("span", { className: `text-[10px] ${theme.textMuted}` }, "20\u301C200 kg"))),
+                React.createElement("div", { className: "flex flex-col gap-1" },
+                    React.createElement("label", { htmlFor: "owner-stride-input", className: `font-medium ${theme.textSecondary}` }, "\u98FC\u3044\u4E3B\u306E\u6B69\u5E45 (cm)"),
+                    React.createElement("input", { id: "owner-stride-input", type: "text", inputMode: "numeric", value: ownerStrideDraft, onChange: (e) => handleNumericDraftChange(e, setOwnerStrideDraft), onCompositionEnd: (e) => setOwnerStrideDraft(normalizeNumericDraft(e.currentTarget.value)), onBlur: (e) => commitNumericProfileField(e.currentTarget.value, 'ownerStrideCm', 40, 120, profile.ownerStrideCm ?? 70, 0, setOwnerStrideDraft), className: `w-full px-3 py-2 rounded-xl text-xs font-bold tabular-nums ${theme.input}` }),
+                    React.createElement("span", { className: `text-[10px] ${theme.textMuted}` }, "40\u301C120 cm\uFF08\u521D\u671F\u5024 70 cm\u30FB\u63A8\u5B9A\u6B69\u6570\u306B\u4F7F\u7528\uFF09")),
                 React.createElement("div", { className: "flex flex-col gap-1 min-w-0" },
                     React.createElement("label", { htmlFor: "dog-birthdate-input", className: `font-medium ${theme.textSecondary}` }, "\u304A\u8A95\u751F\u65E5"),
                     React.createElement("div", { id: "dog-birthdate-box", className: `w-full max-w-full min-w-0 box-border overflow-hidden rounded-xl ${theme.input}` },
@@ -5995,6 +6300,7 @@ function KunKatsuApp() {
             React.createElement("button", { onClick: async () => {
                     const clampedDogWeight = clampProfileNumber(dogWeightDraft, 0.5, 100, profile.weightKg, 1);
                     const clampedOwnerWeight = clampProfileNumber(ownerWeightDraft, 20, 200, profile.ownerWeightKg, 1);
+                    const clampedOwnerStrideCm = clampProfileNumber(ownerStrideDraft, 40, 120, profile.ownerStrideCm ?? 70, 0);
                     const clampedRadius = clampProfileNumber(geofenceRadiusDraft, 150, Number.MAX_SAFE_INTEGER, profile.geofenceRadiusMeters, 0);
                     const clampedStaleDays = clampProfileNumber(staleRouteDaysDraft, 3, 60, profile.staleRouteDays ?? ROUTE_FRESHNESS_DEFAULT_STALE_DAYS, 0);
                     const normalizedProfile = {
@@ -6004,12 +6310,20 @@ function KunKatsuApp() {
                         climateTypeOverride: profile.climateTypeOverride ?? 'auto',
                         weightKg: clampedDogWeight,
                         ownerWeightKg: clampedOwnerWeight,
+                        ownerStrideCm: clampedOwnerStrideCm,
                         geofenceRadiusMeters: clampedRadius,
                         staleRouteDays: clampedStaleDays,
                     };
                     setProfile(normalizedProfile);
+                    if (normalizedProfile.homeLat !== null &&
+                        normalizedProfile.homeLng !== null &&
+                        isInsideHomeGeofence(currentLat, currentLng, normalizedProfile.homeLat, normalizedProfile.homeLng, clampedRadius)) {
+                        setCurrentLat(normalizedProfile.homeLat);
+                        setCurrentLng(normalizedProfile.homeLng);
+                    }
                     setDogWeightDraft(String(clampedDogWeight));
                     setOwnerWeightDraft(String(clampedOwnerWeight));
+                    setOwnerStrideDraft(String(clampedOwnerStrideCm));
                     setGeofenceRadiusDraft(String(clampedRadius));
                     setStaleRouteDaysDraft(String(clampedStaleDays));
                     await saveDogProfile(normalizedProfile);
@@ -6034,11 +6348,17 @@ function KunKatsuApp() {
                 void handleDeleteActionLog(logId);
             } })),
         isWalking && activeWalkEncounter && (React.createElement(EncounterQuickSheet, { key: `walk_${activeWalkEncounter.id}`, encounter: activeWalkEncounter, mode: "walk", darkMode: darkMode, onSave: handleSaveActiveWalkEncounter, onSkip: () => {
+                const wasInHomeZone = Boolean(activeWalkEncounter.inHomeZone);
                 setActiveWalkEncounterId(null);
-                showToast('📍 場所だけ残しました（あとでふりかえりから追記できます）');
+                showToast(wasInHomeZone
+                    ? '🏠 おうち周辺として残しました（あとでふりかえりから追記できます）'
+                    : '📍 場所だけ残しました（あとでふりかえりから追記できます）');
             }, onClose: () => {
+                const wasInHomeZone = Boolean(activeWalkEncounter.inHomeZone);
                 setActiveWalkEncounterId(null);
-                showToast('📍 場所だけ残しました（あとでふりかえりから追記できます）');
+                showToast(wasInHomeZone
+                    ? '🏠 おうち周辺として残しました（あとでふりかえりから追記できます）'
+                    : '📍 場所だけ残しました（あとでふりかえりから追記できます）');
             } })),
         activeTab === 'summary' && editingSummaryEncounter && (React.createElement(EncounterQuickSheet, { key: `summary_${editingSummaryEncounter.id}`, encounter: editingSummaryEncounter, mode: "summary", darkMode: darkMode, isSaving: isSavingEncounterEdit, onSave: (encounterId, patch) => {
                 void handleUpdateSummaryEncounter(encounterId, patch);
